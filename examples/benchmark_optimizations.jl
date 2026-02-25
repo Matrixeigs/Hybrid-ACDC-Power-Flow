@@ -3,7 +3,7 @@
 # Benchmark the optimized sparse Jacobian solver
 
 using Pkg
-Pkg.activate(@__DIR__)
+Pkg.activate(joinpath(@__DIR__, ".."))
 
 using HybridACDCPowerFlow
 using BenchmarkTools

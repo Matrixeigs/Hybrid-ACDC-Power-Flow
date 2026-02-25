@@ -2,8 +2,7 @@
 Test script for JuMP-based feasibility checker
 """
 
-include("../src/HybridACDCPowerFlow.jl")
-using .HybridACDCPowerFlow
+using HybridACDCPowerFlow
 
 using Printf
 

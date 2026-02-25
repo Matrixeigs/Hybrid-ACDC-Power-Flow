@@ -4,14 +4,13 @@
 # Compares actual solution voltages from all three methods
 #
 
-cd(@__DIR__)
+cd(joinpath(@__DIR__, ".."))
 using Pkg
 Pkg.activate(".")
 
 println("Loading HybridACDCPowerFlow module...")
-include("src/HybridACDCPowerFlow.jl")
-using .HybridACDCPowerFlow
-using .HybridACDCPowerFlow: PQ_MODE, VDC_Q, VDC_VAC, ACBus, ACBranch, VSCConverter
+using HybridACDCPowerFlow
+using HybridACDCPowerFlow: PQ_MODE, VDC_Q, VDC_VAC, ACBus, ACBranch, VSCConverter
 using Random
 using Printf
 using Statistics

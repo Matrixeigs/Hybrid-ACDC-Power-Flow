@@ -317,8 +317,16 @@ Notes:
     becomes DC bus 1 (matching the NR solver's convention).
 """
 function build_ieee118_acdc()
+    _case118_file = joinpath(@__DIR__, "..", "data", "case118_hybrid_acdc.jl")
+    if !isfile(_case118_file)
+        error("""
+            IEEE 118-bus hybrid AC/DC case data file not found at:
+              $(_case118_file)
+            Please place `case118_hybrid_acdc.jl` in the `data/` directory of the package.
+            """)
+    end
     if !_CASE118_LOADED[]
-        include(joinpath(@__DIR__, "..", "..", "PF", "case118_hybrid_acdc.jl"))
+        include(_case118_file)
         _CASE118_LOADED[] = true
     end
 

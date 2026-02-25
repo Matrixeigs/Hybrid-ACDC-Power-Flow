@@ -3,7 +3,7 @@
 # Test the FeasibilityExt extension
 
 using Pkg
-Pkg.activate(@__DIR__)
+Pkg.activate(joinpath(@__DIR__, ".."))
 
 println("Loading HybridACDCPowerFlow without extensions...")
 using HybridACDCPowerFlow

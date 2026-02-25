@@ -1,353 +1,195 @@
-# Quick Reference - HybridACDCPowerFlow.jl v0.2.0
+# Quick Reference — HybridACDCPowerFlow.jl v0.4.0
 
-⚡ **One-page cheat sheet for enhanced features**
-
----
-
-## 🚀 Installation
+## Installation
 
 ```julia
 using Pkg
-Pkg.add(path="/path/to/HybridACDCPowerFlow")
+Pkg.develop(path="/path/to/HybridACDCPowerFlow")    # local
+# Pkg.add(url="https://github.com/<user>/HybridACDCPowerFlow.jl.git")  # remote
 
 using HybridACDCPowerFlow
 ```
 
 ---
 
-## 📌 Basic Usage
+## Test Systems
 
-### Standard Power Flow (v0.1.0 Compatible)
 ```julia
-sys = build_ieee14_acdc()
-result = solve_power_flow(sys)
-println("Converged: $(result.converged)")
-```
+sys = build_ieee14_acdc()          # 14 AC + 2 DC buses
+sys = build_ieee24_3area_acdc()    # 24 AC + 4 DC buses (3 areas)
+sys = build_ieee118_acdc()         # 118 AC + 8 DC buses
 
-### Enhanced Adaptive Power Flow (v0.2.0)
-```julia
-sys = build_ieee24_3area_acdc()
+sys = build_case33bw_acdc()        # 33-bus radial distribution
+sys = build_case33mg_acdc()        # 33-bus microgrid
+sys = build_case69_acdc()          # 69-bus radial distribution
+sys = build_case300_acdc()         # 300-bus transmission
+sys = build_case2000_acdc()        # 2000-bus (scalability)
 
-Q_limits = create_default_Q_limits(sys; Qmin_default=-0.5, Qmax_default=1.0)
-
-options = PowerFlowOptions(
-    enable_pv_pq_conversion=true,
-    enable_auto_swing_selection=true,
-    enable_converter_mode_switching=true
-)
-
-result = solve_power_flow_adaptive(sys; options=options, Q_limits=Q_limits)
+sys_ac = build_ac_only_version(sys)  # strip DC/converters
 ```
 
 ---
 
-## 🏝️ Feature 1: Island Detection
+## Basic Power Flow
 
 ```julia
-# Detect islands
-islands = detect_islands(sys)
-
-# Print summary
-print_island_summary(islands, sys)
-
-# Access island data
-for island in islands
-    println("Island $(island.id):")
-    println("  AC buses: $(island.ac_buses)")
-    println("  DC buses: $(island.dc_buses)")
-    println("  Slack: $(island.ac_slack_bus)")
-end
-```
-
-**Output Example**:
-```
-Island 1: 14 AC buses, 2 DC buses
-Island 2: 10 AC buses, 2 DC buses
-```
-
----
-
-## ⚡ Feature 2: PV → PQ Conversion
-
-```julia
-# Create reactive limits
-Q_limits = Dict(
-    2 => ReactiveLimit(-0.4, 0.8),  # Generator 2
-    3 => ReactiveLimit(-0.3, 0.6)   # Generator 3
-)
-
-# Or use defaults
-Q_limits = create_default_Q_limits(sys; Qmin_default=-0.5, Qmax_default=1.0)
-
-# Solve with automatic conversion
-options = PowerFlowOptions(enable_pv_pq_conversion=true)
-result = solve_power_flow_adaptive(sys; options=options, Q_limits=Q_limits)
-
-# Check violations
-violations, Q_actual = check_reactive_limits(
-    sys, result.Vm, result.Va, result.Vdc, Q_limits
-)
-println("Violations: $(length(violations))")
-```
-
----
-
-## 🎯 Feature 3: Auto Swing Bus Selection
-
-```julia
-# Convert slack to PV (simulate slack loss)
-sys.ac_buses[1] = ACBus(1, PV, ...)
-
-# Detect islands
-islands = detect_islands(sys)
-
-# Auto-select slack
-if !islands[1].has_ac_slack
-    slack_bus = auto_select_swing_bus(sys, islands[1])
-    println("Auto-selected slack: bus $slack_bus")
-end
-```
-
-**Selection Criteria** (priority order):
-1. Largest Pg_max
-2. Most connections
-3. Lowest bus number
-
----
-
-## 🔄 Feature 4: Converter Mode Switching
-
-```julia
-# Solve power flow
 result = solve_power_flow(sys)
 
-# Auto-switch converter modes
-switched = auto_switch_converter_mode!(
-    sys, result.Vm, result.Va, result.Vdc;
-    V_low_threshold=0.95,   # Switch to VDC_VAC if V < 0.95
-    V_high_threshold=1.05,  # Switch back if V > 1.05
-    S_limit_frac=0.90,      # Switch to PQ if S > 90% Smax
-    hysteresis=0.02         # Prevent oscillation
-)
+result.converged     # Bool
+result.Vm            # AC voltage magnitudes
+result.Va            # AC voltage angles (rad)
+result.Vdc           # DC voltages
+result.iterations    # Newton-Raphson iterations
+result.residual      # Final residual norm
 
-println("Switched $(length(switched)) converters")
-for idx in switched
-    println("  Converter $idx → $(sys.converters[idx].mode)")
-end
-```
-
-**Mode Transitions**:
-```
-PQ_MODE ↔ VDC_VAC ↔ VDC_Q
-```
-
----
-
-## 🌐 Feature 5: Multi-Island Power Flow
-
-```julia
-# Solve each island independently
-island_results = solve_power_flow_islanded(sys)
-
-for (i, res) in enumerate(island_results)
-    println("Island $i:")
-    println("  Converged: $(res.converged)")
-    println("  Voltage range: [$(minimum(res.Vm)), $(maximum(res.Vm))]")
-end
-```
-
----
-
-## 📊 Data Structures
-
-### PowerFlowOptions
-```julia
-PowerFlowOptions(
-    max_iter=20,                           # Max Newton iterations
-    tol=1e-8,                              # Convergence tolerance
-    enable_pv_pq_conversion=false,         # Enable PV→PQ
-    enable_auto_swing_selection=false,     # Enable auto slack
-    enable_converter_mode_switching=false, # Enable mode switching
-    verbose=false                          # Print details
-)
-```
-
-### IslandInfo
-```julia
-island.id                 # Island number
-island.ac_buses           # Vector{Int}
-island.dc_buses           # Vector{Int}
-island.converters         # Vector{Int}
-island.has_ac_slack       # Bool
-island.ac_slack_bus       # Int (or 0)
-```
-
-### ReactiveLimit
-```julia
-ReactiveLimit(Qmin, Qmax)  # Min/max reactive power (p.u.)
-```
-
----
-
-## 🧪 Test Systems
-
-```julia
-# IEEE 14-bus + 2 DC buses + 2 converters
-sys = build_ieee14_acdc()
-
-# IEEE 24-bus 3-area + 4 DC buses + 4 converters
-sys = build_ieee24_3area_acdc()
-
-# IEEE 118-bus + 6 DC buses + 5 converters
-sys = build_ieee118_acdc()
-
-# AC-only version (remove converters)
-sys_ac = build_ac_only_version(sys)
-```
-
----
-
-## 🔍 Result Analysis
-
-```julia
-result = solve_power_flow_adaptive(sys; options, Q_limits)
-
-# Convergence
-result.converged    # Bool
-
-# Voltages
-result.Vm           # AC voltage magnitudes
-result.Va           # AC voltage angles (rad)
-result.Vdc          # DC voltages
-
-# Islands (if adaptive)
-result.islands      # Vector{IslandInfo}
-
-# Iterations
-result.iterations   # Total Newton iterations
-
-# Extract voltages
 Vm, Va, Vdc = get_bus_voltages(result)
-
-# Branch flows
 Pij, Qij = get_branch_flows(sys, result)
 ```
 
 ---
 
-## ⚙️ Common Workflows
+## Optimized Solver (SolverWorkspace)
 
-### 1. N-k Contingency Analysis
 ```julia
-sys = build_ieee24_3area_acdc()
+ws = create_solver_workspace(sys)
+result = solve_power_flow(sys; workspace=ws)
 
-# Remove k branches
-for i in 1:k
-    sys.ac_branches[i] = ACBranch(..., false)  # Set status=false
-end
+# Reuse ws across many solves with the same topology
+```
 
-# Solve adaptive
-result = solve_power_flow_adaptive(sys; options, Q_limits)
+---
 
-# Check islanding
+## Island Detection
+
+```julia
 islands = detect_islands(sys)
-println("System split into $(length(islands)) islands")
+print_island_summary(islands, sys)
+
+for island in islands
+    println("Island $(island.id): AC=$(island.ac_buses), slack=$(island.ac_slack_bus)")
+end
+
+island_results = solve_power_flow_islanded(sys)
 ```
 
-### 2. Generator Reactive Capability Study
+---
+
+## PV → PQ Conversion
+
 ```julia
-# Tight limits
-Q_limits = create_default_Q_limits(sys; Qmin_default=-0.3, Qmax_default=0.5)
+Q_limits = create_default_Q_limits(sys; Qmin_default=-0.5, Qmax_default=1.0)
 
-options = PowerFlowOptions(enable_pv_pq_conversion=true)
-result = solve_power_flow_adaptive(sys; options, Q_limits)
+# Or manual:
+Q_limits = Dict(2 => ReactiveLimit(-0.4, 0.8), 3 => ReactiveLimit(-0.3, 0.6))
 
-# Find violations
 violations, Q_actual = check_reactive_limits(sys, result.Vm, result.Va, result.Vdc, Q_limits)
-
-for (bus, Q) in violations
-    lim = Q_limits[bus]
-    println("Bus $bus: Q=$(Q) violates [$(lim.Qmin), $(lim.Qmax)]")
-end
 ```
 
-### 3. Extreme Event Simulation
+---
+
+## Adaptive Power Flow (All-in-One)
+
 ```julia
-# Progressive fault
-for i in 1:10
-    sys.ac_branches[i] = ACBranch(..., false)
-    
-    result = solve_power_flow_adaptive(sys; options, Q_limits)
-    
-    if !result.converged
-        println("System unstable after $i faults")
-        break
-    end
-    
-    islands = detect_islands(sys)
-    println("Fault $i: $(length(islands)) islands")
-end
+options = PowerFlowOptions(
+    max_iter=20,
+    tol=1e-8,
+    enable_pv_pq_conversion=true,
+    enable_auto_swing_selection=true,
+    enable_converter_mode_switching=true,
+    verbose=false
+)
+
+Q_limits = create_default_Q_limits(sys)
+result = solve_power_flow_adaptive(sys; options=options, Q_limits=Q_limits)
 ```
 
 ---
 
-## 📖 Documentation
+## Converter Mode Switching
 
-- **Full features**: `ENHANCED_FEATURES.md`
-- **Changelog**: `CHANGELOG_v0.2.0.md`
-- **Theory**: `docs/TheoreticalFoundations.pdf`
-- **Tests**: `test/test_enhanced.jl`
-
----
-
-## 🐛 Troubleshooting
-
-### "UndefVarError: function not defined"
-→ Restart Julia and reload module after updates
-
-### "BoundsError in detect_islands"
-→ Fixed in v0.2.0; update to latest version
-
-### "Does not converge with tight Q limits"
-→ Expected; relax limits or increase `max_iter`
-
-### "Mode switching oscillates"
-→ Increase `hysteresis` parameter
-
----
-
-## 📊 Performance Tips
-
-1. **Start simple**: Test with `build_ieee14_acdc()` first
-2. **Enable selectively**: Only enable features you need
-3. **Relax tolerance**: Use `tol=1e-6` for fault scenarios
-4. **Check islands**: Run `detect_islands()` before adaptive solver
-
----
-
-## 🎯 Validation
-
-Run comprehensive test suite:
-```bash
-julia test/test_enhanced.jl
+```julia
+switched = auto_switch_converter_mode!(
+    sys, result.Vm, result.Va, result.Vdc;
+    V_low_threshold=0.95,
+    V_high_threshold=1.05,
+    S_limit_frac=0.90,
+    hysteresis=0.02
+)
 ```
 
-Expected:
-```
-Test Summary: | Pass  Total  Time
-Enhanced      |   19     19  1.5s
+Control modes: `PQ_MODE`, `VDC_Q`, `VDC_VAC`
 
-ALL TESTS PASSED ✅
+---
+
+## Distributed Slack
+
+```julia
+dist_slack = create_participation_factors(sys; method=:capacity)  # or :droop, :equal
+
+result = solve_power_flow_distributed_slack(sys, dist_slack; verbose=true)
+result = solve_power_flow_distributed_slack_full(sys, dist_slack; enforce_limits=true)
+```
+
+Manual configuration:
+
+```julia
+dist_slack = DistributedSlack(
+    [1, 2, 6],           # participating buses
+    [0.4, 0.4, 0.2],    # participation factors
+    1,                    # reference bus
+    Dict(2 => 0.05)      # capacity limits
+)
 ```
 
 ---
 
-## 📜 License
+## Feasibility Checking (Extension)
 
-MIT License - Free for academic and commercial use
+```julia
+using JuMP, Ipopt, NLsolve  # triggers FeasibilityExt loading
+
+result = check_power_flow_feasibility(sys; method=:nlsolve, verbose=true)
+# or method=:jump for JuMP+Ipopt
+
+result.feasible              # Bool
+result.status                # String
+result.load_margin           # Float64 (p.u.)
+```
 
 ---
 
-**Version**: 0.2.0  
-**Status**: Production Ready  
-**Tests**: 19/19 Passing
+## Data Structures
+
+| Type | Fields |
+|------|--------|
+| `ACBus` | `id, type, Pd, Qd, Pg, Qg, Vm, Va, area` |
+| `ACBranch` | `from, to, r, x, b, tap, status` |
+| `DCBus` | `id, Vdc_set, Pdc` |
+| `DCBranch` | `from, to, r, status` |
+| `VSCConverter` | `id, ac_bus, dc_bus, mode, Pset, Qset, Vdc_set, Vac_set, Ploss_a/b/c, Smax, G_droop, status` |
+| `HybridSystem` | `ac_buses, ac_branches, baseMVA, dc_buses, dc_branches, converters, ...` |
+| `BusType` | `PQ`, `PV`, `SLACK` |
+| `ConverterMode` | `PQ_MODE`, `VDC_Q`, `VDC_VAC` |
+
+---
+
+## Running Tests
+
+```julia
+using Pkg
+Pkg.test("HybridACDCPowerFlow")
+```
+
+---
+
+## Source Layout
+
+```
+src/HybridACDCPowerFlow.jl   # module entry, exports
+src/PowerSystem.jl            # core solver, sparse Jacobian
+src/PowerSystemEnhanced.jl    # islands, PV→PQ, distributed slack
+src/MatpowerParser.jl         # MATPOWER .m parser
+src/TestSystems.jl            # test case builders
+src/FeasibilityChecker.jl     # stub interface for extension
+ext/FeasibilityExt.jl         # optional JuMP/Ipopt/NLsolve
+```
