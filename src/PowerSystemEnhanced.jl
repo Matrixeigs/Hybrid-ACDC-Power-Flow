@@ -10,7 +10,7 @@ Enhanced hybrid AC/DC power system solver with:
 - Advanced Newton-Raphson with adaptive control
 
 Author: Tianyang Zhao
-Version: 0.3.0 (Distributed Slack)
+Version: 0.5.0 (JuliaPowerCase Integration)
 """
 module PowerSystemEnhanced
 
@@ -18,10 +18,12 @@ using LinearAlgebra, SparseArrays, Printf
 
 # Re-export everything from base PowerSystem
 using ..PowerSystem
-using ..PowerSystem: ACBus, ACBranch, DCBus, DCBranch, VSCConverter, HybridSystem,
-                     BusType, PQ, PV, SLACK, ConverterMode, PQ_MODE, VDC_Q, VDC_VAC,
+using ..PowerSystem: ACBus, ACBranch, DCBus, DCBranch, VSCConverter, HybridSystem, Generator,
+                     HybridPowerSystem, IslandInfo, to_solver_system,
+                     BusType, PQ, PV, SLACK, PQ_MODE, VDC_Q, VDC_VAC,
                      build_admittance_matrix, converter_loss, solve_power_flow,
-                     converter_ac_injection, converter_dc_injection
+                     converter_ac_injection, converter_dc_injection,
+                     jpc_detect_islands, jpc_extract_island_subsystem
 
 export detect_islands, solve_power_flow_islanded, solve_power_flow_adaptive,
        check_reactive_limits, pv_to_pq_conversion!, auto_select_swing_bus,
@@ -79,18 +81,9 @@ struct DistributedSlack
     end
 end
 
-"""Island information for disconnected network analysis"""
-struct IslandInfo
-    id::Int
-    ac_buses::Vector{Int}      # AC bus indices in this island
-    dc_buses::Vector{Int}      # DC bus indices in this island  
-    converters::Vector{Int}    # Converter indices connecting this island
-    has_ac_slack::Bool
-    has_dc_slack::Bool
-    ac_slack_bus::Int          # Selected AC slack bus (0 if none)
-    dc_slack_bus::Int          # Selected DC slack bus (0 if none)
-    has_generators::Bool       # Whether island has any online generators (Pg > 0)
-end
+# Note: IslandInfo is now imported from JuliaPowerCase via PowerSystem
+# It has the same fields: id, ac_buses, dc_buses, converters, has_ac_slack,
+# has_dc_slack, ac_slack_bus, dc_slack_bus, has_generators
 
 """Power flow solver options"""
 struct PowerFlowOptions
@@ -136,25 +129,25 @@ function detect_islands(sys::HybridSystem)
     
     # AC branches
     for br in sys.ac_branches
-        br.status || continue
-        push!(adj[br.from], br.to)
-        push!(adj[br.to], br.from)
+        br.in_service || continue
+        push!(adj[br.from_bus], br.to_bus)
+        push!(adj[br.to_bus], br.from_bus)
     end
     
     # DC branches
     for br in sys.dc_branches
-        br.status || continue
-        di = nac + br.from
-        dj = nac + br.to
+        br.in_service || continue
+        di = nac + br.from_bus
+        dj = nac + br.to_bus
         push!(adj[di], dj)
         push!(adj[dj], di)
     end
     
     # Converters act as edges: AC bus ↔ DC bus
     for conv in sys.converters
-        conv.status || continue
-        ac_node = conv.ac_bus
-        dc_node = nac + conv.dc_bus
+        conv.in_service || continue
+        ac_node = conv.bus_ac
+        dc_node = nac + conv.bus_dc
         push!(adj[ac_node], dc_node)
         push!(adj[dc_node], ac_node)
     end
@@ -194,27 +187,27 @@ function detect_islands(sys::HybridSystem)
         # Converters belonging to this island
         conv_in_island = Int[]
         for (ci, conv) in enumerate(sys.converters)
-            conv.status || continue
-            if conv.ac_bus in ac_set || conv.dc_bus in dc_set
+            conv.in_service || continue
+            if conv.bus_ac in ac_set || conv.bus_dc in dc_set
                 push!(conv_in_island, ci)
             end
         end
         
         # Generator check
         has_generators = any(
-            sys.ac_buses[i].Pg > 0.0 || sys.ac_buses[i].type == SLACK || sys.ac_buses[i].type == PV
+            sys.Pg[i] > 0.0 || sys.ac_buses[i].bus_type == SLACK || sys.ac_buses[i].bus_type == PV
             for i in ac_in_island
         )
         if !has_generators && !isempty(conv_in_island)
-            has_generators = any(abs(sys.converters[ci].Pset) > 0.0 for ci in conv_in_island)
+            has_generators = any(abs(sys.converters[ci].p_set_mw) > 0.0 for ci in conv_in_island)
         end
         
-        has_ac_slack = any(sys.ac_buses[i].type == SLACK for i in ac_in_island)
+        has_ac_slack = any(sys.ac_buses[i].bus_type == SLACK for i in ac_in_island)
         has_dc_slack = !isempty(dc_in_island)
         
         ac_slack = 0
         if has_ac_slack
-            idx = findfirst(i -> sys.ac_buses[i].type == SLACK, ac_in_island)
+            idx = findfirst(i -> sys.ac_buses[i].bus_type == SLACK, ac_in_island)
             ac_slack = idx === nothing ? 0 : ac_in_island[idx]
         end
         dc_slack = isempty(dc_in_island) ? 0 : dc_in_island[1]
@@ -227,6 +220,24 @@ function detect_islands(sys::HybridSystem)
     
     return islands
 end
+
+"""
+    detect_islands(hps::HybridPowerSystem) -> Vector{IslandInfo}
+
+Detect islands in a JuliaPowerCase HybridPowerSystem.
+Delegates to JuliaPowerCase's implementation.
+"""
+detect_islands(hps::HybridPowerSystem) = jpc_detect_islands(hps)
+
+"""
+    extract_island_subsystem(hps::HybridPowerSystem, island::IslandInfo; slack_bus_override=0)
+        -> (sub_hps, ac_map, dc_map)
+
+Extract a standalone HybridPowerSystem for a single island.
+Returns a JuliaPowerCase HybridPowerSystem (not HybridSystem).
+"""
+extract_island_subsystem(hps::HybridPowerSystem, island::IslandInfo; slack_bus_override::Int=0) =
+    jpc_extract_island_subsystem(hps, island; slack_bus_override=slack_bus_override)
 
 # ─── Island Sub-system Extraction ─────────────────────────────────────────────
 
@@ -275,53 +286,81 @@ function extract_island_subsystem(sys::HybridSystem, island::IslandInfo; slack_b
     sub_ac_buses = ACBus[]
     for orig in sort(island.ac_buses)
         b = sys.ac_buses[orig]
-        bus_type = orig == slack_bus_override ? SLACK : b.type
-        bus_va = orig == slack_bus_override ? 0.0 : b.Va
-        push!(sub_ac_buses, ACBus(ac_map[orig], bus_type, b.Pd, b.Qd,
-                                   b.Pg, b.Qg, b.Vm, bus_va, b.area))
+        btype = orig == slack_bus_override ? SLACK : b.bus_type
+        bva = orig == slack_bus_override ? 0.0 : b.va_deg
+        push!(sub_ac_buses, ACBus(index=ac_map[orig], bus_type=btype,
+                                   pd_mw=b.pd_mw, qd_mvar=b.qd_mvar,
+                                   vm_pu=b.vm_pu, va_deg=bva, area=b.area,
+                                   base_kv=b.base_kv, vmax_pu=b.vmax_pu, vmin_pu=b.vmin_pu,
+                                   gs_mw=b.gs_mw, bs_mvar=b.bs_mvar,
+                                   zone=b.zone, in_service=b.in_service, name=b.name))
     end
 
     # ── AC branches (only those with both ends inside this island) ────
     sub_ac_branches = ACBranch[]
     for br in sys.ac_branches
-        br.status || continue
-        (br.from in ac_set && br.to in ac_set) || continue
-        push!(sub_ac_branches, ACBranch(ac_map[br.from], ac_map[br.to],
-                                         br.r, br.x, br.b, br.tap, br.status))
+        br.in_service || continue
+        (br.from_bus in ac_set && br.to_bus in ac_set) || continue
+        push!(sub_ac_branches, ACBranch(index=length(sub_ac_branches)+1,
+                                         from_bus=ac_map[br.from_bus], to_bus=ac_map[br.to_bus],
+                                         r_pu=br.r_pu, x_pu=br.x_pu, b_pu=br.b_pu,
+                                         tap=br.tap, in_service=br.in_service))
     end
 
     # ── DC buses (renumbered) ─────────────────────────────────────────
     sub_dc_buses = DCBus[]
     for orig in sort(island.dc_buses)
         b = sys.dc_buses[orig]
-        push!(sub_dc_buses, DCBus(dc_map[orig], b.Vdc_set, b.Pdc))
+        push!(sub_dc_buses, DCBus(index=dc_map[orig], vm_pu=b.vm_pu, pd_mw=b.pd_mw,
+                                   in_service=b.in_service))
     end
 
     # ── DC branches ───────────────────────────────────────────────────
     sub_dc_branches = DCBranch[]
     for br in sys.dc_branches
-        br.status || continue
-        (br.from in dc_set && br.to in dc_set) || continue
-        push!(sub_dc_branches, DCBranch(dc_map[br.from], dc_map[br.to],
-                                         br.r, br.status))
+        br.in_service || continue
+        (br.from_bus in dc_set && br.to_bus in dc_set) || continue
+        push!(sub_dc_branches, DCBranch(index=length(sub_dc_branches)+1,
+                                         from_bus=dc_map[br.from_bus], to_bus=dc_map[br.to_bus],
+                                         r_pu=br.r_pu, in_service=br.in_service))
     end
 
     # ── Converters (only those with both AC and DC bus inside) ────────
     sub_converters = VSCConverter[]
     for conv in sys.converters
-        conv.status || continue
-        (conv.ac_bus in ac_set && conv.dc_bus in dc_set) || continue
+        conv.in_service || continue
+        (conv.bus_ac in ac_set && conv.bus_dc in dc_set) || continue
         push!(sub_converters, VSCConverter(
-            conv.id, ac_map[conv.ac_bus], dc_map[conv.dc_bus],
-            conv.mode, conv.Pset, conv.Qset, conv.Vdc_set, conv.Vac_set,
-            conv.Ploss_a, conv.Ploss_b, conv.Ploss_c, conv.Smax, conv.status;
-            G_droop=conv.G_droop))
+            index=length(sub_converters)+1,
+            bus_ac=ac_map[conv.bus_ac], bus_dc=dc_map[conv.bus_dc],
+            control_mode=conv.control_mode,
+            p_set_mw=conv.p_set_mw, q_set_mvar=conv.q_set_mvar,
+            v_dc_set_pu=conv.v_dc_set_pu, v_ac_set_pu=conv.v_ac_set_pu,
+            loss_mw=conv.loss_mw, loss_percent=conv.loss_percent, eta=conv.eta,
+            p_rated_mw=conv.p_rated_mw, in_service=conv.in_service,
+            k_vdc=conv.k_vdc))
+    end
+
+    # ── Generators (remap bus index) ──────────────────────────────────
+    sub_generators = Generator[]
+    for gen in sys.generators
+        gen.in_service || continue
+        haskey(ac_map, gen.bus) || continue
+        push!(sub_generators, Generator(
+            index=length(sub_generators)+1,
+            bus=ac_map[gen.bus],
+            pg_mw=gen.pg_mw, qg_mvar=gen.qg_mvar,
+            vg_pu=gen.vg_pu, mbase_mva=gen.mbase_mva,
+            pmax_mw=gen.pmax_mw, pmin_mw=gen.pmin_mw,
+            qmax_mvar=gen.qmax_mvar, qmin_mvar=gen.qmin_mvar,
+            in_service=gen.in_service, is_slack=gen.is_slack,
+            name=gen.name))
     end
 
     # ── Build sub-system (automatically builds Ybus & Gdc) ───────────
     sub_sys = HybridSystem(sub_ac_buses, sub_ac_branches,
                            sub_dc_buses, sub_dc_branches,
-                           sub_converters; baseMVA=sys.baseMVA)
+                           sub_converters; generators=sub_generators, baseMVA=sys.baseMVA)
 
     return sub_sys, ac_map, dc_map
 end
@@ -352,20 +391,20 @@ function check_reactive_limits(sys::HybridSystem, Vm::Vector{Float64},
     
     # Add converter reactive injections
     for conv in sys.converters
-        conv.status || continue
-        _, Qinj = PowerSystem.converter_ac_injection(conv, Vm, Va, Vdc)
-        Q_actual[conv.ac_bus] += Qinj
+        conv.in_service || continue
+        _, Qinj = PowerSystem.converter_ac_injection(conv, Vm, Va, Vdc, sys.baseMVA, sys.loss_model)
+        Q_actual[conv.bus_ac] += Qinj
     end
     
     # Subtract scheduled reactive load
     for (i, bus) in enumerate(sys.ac_buses)
-        Q_actual[i] -= bus.Qd
+        Q_actual[i] -= bus.qd_mvar / sys.baseMVA
     end
     
     # Check violations for PV buses
     violations = Tuple{Int, Symbol, Float64}[]  # (bus_id, :max/:min, Q_value)
     for (i, bus) in enumerate(sys.ac_buses)
-        bus.type != PV && continue
+        bus.bus_type != PV && continue
         haskey(Q_limits, i) || continue
         
         lim = Q_limits[i]
@@ -403,13 +442,20 @@ function pv_to_pq_conversion!(sys::HybridSystem, violations::Vector{Tuple{Int, S
         
         Q_new = limit_type == :max ? lim.Qmax : lim.Qmin
         
+        # Note: Q_new adjusts the Qg contribution; we update the generator
+        # Qg is on sys.Qg, not on the bus. For PV→PQ conversion, we change
+        # the bus type. The solver will use the Q limit via sys.Qg.
         sys.ac_buses[bus_idx] = ACBus(
-            old_bus.id, PQ,  # Convert to PQ type
-            old_bus.Pd, old_bus.Qd,
-            old_bus.Pg, Q_new,  # Set Q to limit
-            old_bus.Vm, old_bus.Va,  # Keep voltage as initial guess
-            old_bus.area
-        )
+            index=old_bus.index, bus_type=PQ,
+            pd_mw=old_bus.pd_mw, qd_mvar=old_bus.qd_mvar,
+            vm_pu=old_bus.vm_pu, va_deg=old_bus.va_deg,
+            area=old_bus.area, base_kv=old_bus.base_kv,
+            vmax_pu=old_bus.vmax_pu, vmin_pu=old_bus.vmin_pu,
+            gs_mw=old_bus.gs_mw, bs_mvar=old_bus.bs_mvar,
+            zone=old_bus.zone, in_service=old_bus.in_service,
+            name=old_bus.name)
+        # Clamp Qg to the violated limit (in p.u.)
+        sys.Qg[bus_idx] = Q_new
         
         push!(converted, bus_idx)
     end
@@ -443,11 +489,11 @@ function auto_select_swing_bus(sys::HybridSystem, island::IslandInfo)
     
     # Priority 1: Existing slack bus
     for i in buses_in_island
-        sys.ac_buses[i].type == SLACK && return i
+        sys.ac_buses[i].bus_type == SLACK && return i
     end
     
     # Priority 2: Largest online generator (any bus type with Pg > 0)
-    gen_buses = [(i, sys.ac_buses[i].Pg) for i in buses_in_island if sys.ac_buses[i].Pg > 0.0]
+    gen_buses = [(i, sys.Pg[i]) for i in buses_in_island if sys.Pg[i] > 0.0]
     if !isempty(gen_buses)
         sort!(gen_buses, by=x -> x[2], rev=true)
         return gen_buses[1][1]
@@ -455,7 +501,7 @@ function auto_select_swing_bus(sys::HybridSystem, island::IslandInfo)
     
     # Priority 3: Any PV bus (even if Pg == 0, it's a voltage-controlled bus)
     for i in buses_in_island
-        sys.ac_buses[i].type == PV && return i
+        sys.ac_buses[i].bus_type == PV && return i
     end
     
     # Fallback: First bus (emergency — dead island with no generation)
@@ -477,8 +523,8 @@ function auto_select_dc_slack_bus(sys::HybridSystem, island::IslandInfo)
     # Priority 1: DC bus with voltage-controlling converter
     for i in dc_buses_in_island
         for conv in sys.converters
-            if conv.status && conv.dc_bus == i && 
-               (conv.mode == VDC_Q || conv.mode == VDC_VAC)
+            if conv.in_service && conv.bus_dc == i && 
+               (conv.control_mode == VDC_Q || conv.control_mode == VDC_VAC)
                 return i
             end
         end
@@ -509,26 +555,26 @@ function auto_switch_converter_mode!(sys::HybridSystem, Vm::Vector{Float64},
     switched = Int[]
     
     for (idx, conv) in enumerate(sys.converters)
-        conv.status || continue
+        conv.in_service || continue
         
-        V_ac = Vm[conv.ac_bus]
-        Pac, Qac = PowerSystem.converter_ac_injection(conv, Vm, Va, Vdc)
+        V_ac = Vm[conv.bus_ac]
+        Pac, Qac = PowerSystem.converter_ac_injection(conv, Vm, Va, Vdc, sys.baseMVA, sys.loss_model)
         S_ac = sqrt(Pac^2 + Qac^2)
         
-        old_mode = conv.mode
+        old_mode = conv.control_mode
         new_mode = old_mode
         
-        if conv.mode == PQ_MODE
+        if conv.control_mode == PQ_MODE
             # Switch to VDC_VAC if AC voltage too low (voltage support needed)
             if V_ac < V_low_threshold
                 new_mode = VDC_VAC
             end
-        elseif conv.mode == VDC_VAC
+        elseif conv.control_mode == VDC_VAC
             # Switch to PQ_MODE if overloaded
-            if S_ac > S_limit_frac * conv.Smax
+            if S_ac > S_limit_frac * conv.p_rated_mw / sys.baseMVA
                 new_mode = PQ_MODE
             end
-        elseif conv.mode == VDC_Q
+        elseif conv.control_mode == VDC_Q
             # Switch to VDC_VAC if AC voltage support needed
             if V_ac < V_low_threshold || V_ac > V_high_threshold
                 new_mode = VDC_VAC
@@ -538,11 +584,14 @@ function auto_switch_converter_mode!(sys::HybridSystem, Vm::Vector{Float64},
         if new_mode != old_mode
             # Update converter mode
             sys.converters[idx] = VSCConverter(
-                conv.id, conv.ac_bus, conv.dc_bus, new_mode,
-                conv.Pset, conv.Qset, conv.Vdc_set,
-                V_ac,  # Use current voltage as new setpoint for VDC_VAC
-                conv.Ploss_a, conv.Ploss_b, conv.Ploss_c, conv.Smax, true;
-                G_droop=conv.G_droop
+                index=conv.index, bus_ac=conv.bus_ac, bus_dc=conv.bus_dc,
+                control_mode=new_mode,
+                p_set_mw=conv.p_set_mw, q_set_mvar=conv.q_set_mvar,
+                v_dc_set_pu=conv.v_dc_set_pu,
+                v_ac_set_pu=V_ac,  # Use current voltage as new setpoint for VDC_VAC
+                loss_mw=conv.loss_mw, loss_percent=conv.loss_percent, eta=conv.eta,
+                p_rated_mw=conv.p_rated_mw, in_service=true,
+                k_vdc=conv.k_vdc
             )
             push!(switched, idx)
         end
@@ -593,9 +642,9 @@ function solve_power_flow_adaptive(sys::HybridSystem;
     # Step 2: Prepare global solution arrays
     nac = length(sys.ac_buses)
     ndc = length(sys.dc_buses)
-    Vm_global = [b.Vm for b in sys.ac_buses]
-    Va_global = [b.Va for b in sys.ac_buses]
-    Vdc_global = ndc > 0 ? [b.Vdc_set for b in sys.dc_buses] : Float64[]
+    Vm_global = [b.vm_pu for b in sys.ac_buses]
+    Va_global = [deg2rad(b.va_deg) for b in sys.ac_buses]
+    Vdc_global = ndc > 0 ? [b.vm_pu for b in sys.dc_buses] : Float64[]
     
     converged_all = true
     total_iterations = 0
@@ -626,13 +675,13 @@ function solve_power_flow_adaptive(sys::HybridSystem;
         # ── Power balance feasibility check ───────────────────────────
         # If total load exceeds total generation capacity, the island
         # cannot converge no matter what — skip it early.
-        sum_Pg = sum(sys.ac_buses[i].Pg for i in island.ac_buses)
-        sum_Pd = sum(sys.ac_buses[i].Pd for i in island.ac_buses)
+        sum_Pg = sum(sys.Pg[i] for i in island.ac_buses)
+        sum_Pd = sum(sys.ac_buses[i].pd_mw / sys.baseMVA for i in island.ac_buses)
         # Include PQ_MODE converter injections (positive Pset = generation)
         for ci in island.converters
             conv = sys.converters[ci]
-            if conv.mode == PQ_MODE && conv.Pset > 0
-                sum_Pg += conv.Pset
+            if conv.control_mode == PQ_MODE && conv.p_set_mw > 0
+                sum_Pg += conv.p_set_mw / sys.baseMVA
             end
         end
         if sum_Pd > sum_Pg + 1e-6   # small tolerance
@@ -657,15 +706,15 @@ function solve_power_flow_adaptive(sys::HybridSystem;
         if length(island.ac_buses) == 1
             bus_idx = island.ac_buses[1]
             b = sys.ac_buses[bus_idx]
-            Vm_global[bus_idx] = b.Vm
+            Vm_global[bus_idx] = b.vm_pu
             Va_global[bus_idx] = 0.0
             # DC buses associated with this single-bus island keep their setpoints
             for i in island.dc_buses
                 if i <= length(Vdc_global)
-                    Vdc_global[i] = sys.dc_buses[i].Vdc_set
+                    Vdc_global[i] = sys.dc_buses[i].vm_pu
                 end
             end
-            options.verbose && println("  Single-bus island $(island.id) (bus $bus_idx): Vm=$(b.Vm)")
+            options.verbose && println("  Single-bus island $(island.id) (bus $bus_idx): Vm=$(b.vm_pu)")
             continue
         end
         
@@ -675,7 +724,7 @@ function solve_power_flow_adaptive(sys::HybridSystem;
             if !island.has_ac_slack && !isempty(island.ac_buses)
                 slack_override = auto_select_swing_bus(sys, island)
                 if slack_override > 0
-                    options.verbose && println("  Auto-selected AC slack: bus $slack_override (Pg=$(sys.ac_buses[slack_override].Pg))")
+                    options.verbose && println("  Auto-selected AC slack: bus $slack_override (Pg=$(sys.Pg[slack_override]))")
                 else
                     options.verbose && println("  ⚠ No suitable slack bus found for island $(island.id)")
                 end
@@ -684,10 +733,6 @@ function solve_power_flow_adaptive(sys::HybridSystem;
         
         # ── Extract sub-system for this island ────────────────────────
         sub_sys, ac_map, dc_map = extract_island_subsystem(sys, island; slack_bus_override=slack_override)
-        
-        # Reverse maps: local → original
-        ac_rmap = Dict(v => k for (k, v) in ac_map)
-        dc_rmap = Dict(v => k for (k, v) in dc_map)
         
         # ── Translate Q_limits to sub-system indices ──────────────────
         sub_Q_limits = Dict{Int, ReactiveLimit}()
@@ -713,8 +758,12 @@ function solve_power_flow_adaptive(sys::HybridSystem;
                 sub_flat = deepcopy(sub_sys)
                 for bi in 1:length(sub_flat.ac_buses)
                     b = sub_flat.ac_buses[bi]
-                    sub_flat.ac_buses[bi] = ACBus(b.id, b.type, b.Pd, b.Qd,
-                                                   b.Pg, b.Qg, 1.0, 0.0, b.area)
+                    sub_flat.ac_buses[bi] = ACBus(index=b.index, bus_type=b.bus_type,
+                                                   pd_mw=b.pd_mw, qd_mvar=b.qd_mvar,
+                                                   vm_pu=1.0, va_deg=0.0, area=b.area,
+                                                   base_kv=b.base_kv, vmax_pu=b.vmax_pu, vmin_pu=b.vmin_pu,
+                                                   gs_mw=b.gs_mw, bs_mvar=b.bs_mvar,
+                                                   zone=b.zone, in_service=b.in_service, name=b.name)
                 end
                 sub_flat.Ybus = build_admittance_matrix(sub_flat)
                 result = PowerSystem.solve_power_flow(sub_flat;
@@ -730,16 +779,13 @@ function solve_power_flow_adaptive(sys::HybridSystem;
                     sub_pq = deepcopy(sub_sys)
                     for bi in 1:length(sub_pq.ac_buses)
                         b = sub_pq.ac_buses[bi]
-                        if b.type == PV
-                            sub_pq.ac_buses[bi] = ACBus(b.id, PQ, b.Pd, b.Qd,
-                                                         b.Pg, b.Qg, 1.0, 0.0, b.area)
-                        elseif b.type == SLACK
-                            sub_pq.ac_buses[bi] = ACBus(b.id, SLACK, b.Pd, b.Qd,
-                                                         b.Pg, b.Qg, 1.0, 0.0, b.area)
-                        else
-                            sub_pq.ac_buses[bi] = ACBus(b.id, b.type, b.Pd, b.Qd,
-                                                         b.Pg, b.Qg, 1.0, 0.0, b.area)
-                        end
+                        new_type = b.bus_type == PV ? PQ : b.bus_type
+                        sub_pq.ac_buses[bi] = ACBus(index=b.index, bus_type=new_type,
+                                                     pd_mw=b.pd_mw, qd_mvar=b.qd_mvar,
+                                                     vm_pu=1.0, va_deg=0.0, area=b.area,
+                                                     base_kv=b.base_kv, vmax_pu=b.vmax_pu, vmin_pu=b.vmin_pu,
+                                                     gs_mw=b.gs_mw, bs_mvar=b.bs_mvar,
+                                                     zone=b.zone, in_service=b.in_service, name=b.name)
                     end
                     sub_pq.Ybus = build_admittance_matrix(sub_pq)
                     result = PowerSystem.solve_power_flow(sub_pq;
@@ -781,12 +827,8 @@ function solve_power_flow_adaptive(sys::HybridSystem;
                                                        result.Vdc, sub_Q_limits)
                 if !isempty(violations)
                     converted = pv_to_pq_conversion!(sub_sys, violations, sub_Q_limits)
-                    # Also update original system's bus types
-                    for local_idx in converted
-                        orig_idx = ac_rmap[local_idx]
-                        sys.ac_buses[orig_idx] = sub_sys.ac_buses[local_idx]
-                    end
-                    options.verbose && println("  Converted $(length(converted)) PV→PQ buses")
+                    # Note: conversions stay local to sub_sys; caller's sys is not mutated
+                    options.verbose && println("  Converted $(length(converted)) PV→PQ buses (local to subsystem)")
                     continue
                 end
             end
@@ -824,8 +866,91 @@ function solve_power_flow_islanded(sys::HybridSystem;
     islands = detect_islands(sys)
     result_global = solve_power_flow_adaptive(sys; options=options)
     
-    results = []
+    # Rebuild Ybus to ensure it reflects current branch status (for residual calculation)
+    rebuild_matrices!(sys)
+    
+    # Compute per-island convergence by checking residual for each island
+    baseMVA = sys.baseMVA
+    G = real(sys.Ybus)
+    B = imag(sys.Ybus)
+    Vm = result_global.Vm
+    Va = result_global.Va
+    Vdc = result_global.Vdc
+    
+    results = NamedTuple[]
     for island in islands
+        # Compute power mismatch for this island's buses
+        island_converged = true
+        max_residual = 0.0
+        
+        for i in island.ac_buses
+            bus = sys.ac_buses[i]
+            bus.bus_type == SLACK && continue  # Skip slack bus
+            
+            # Compute P and Q calc for this bus
+            Pi = 0.0
+            Qi = 0.0
+            for j in island.ac_buses
+                θij = Va[i] - Va[j]
+                Gij = G[i,j]
+                Bij = B[i,j]
+                Pi += Vm[i] * Vm[j] * (Gij * cos(θij) + Bij * sin(θij))
+                Qi += Vm[i] * Vm[j] * (Gij * sin(θij) - Bij * cos(θij))
+            end
+            
+            # Scheduled values
+            Psch = sys.Pg[i] - bus.pd_mw / baseMVA
+            Qsch = sys.Qg[i] - bus.qd_mvar / baseMVA
+            
+            # Add converter contributions
+            for conv in sys.converters
+                conv.in_service || continue
+                if conv.bus_ac == i
+                    Pac, Qac = converter_ac_injection(conv, Vm, Va, Vdc, baseMVA, sys.loss_model)
+                    Psch += Pac
+                    Qsch += Qac
+                end
+            end
+            
+            ΔP = abs(Psch - Pi)
+            max_residual = max(max_residual, ΔP)
+            if bus.bus_type != PV
+                ΔQ = abs(Qsch - Qi)
+                max_residual = max(max_residual, ΔQ)
+            end
+        end
+        
+        # DC power balance check (skip island's DC slack bus)
+        if !isempty(island.dc_buses) && length(Vdc) > 0
+            Gdc = sys.Gdc
+            dc_slack = island.dc_slack_bus  # Use island-specific DC slack
+            for k in island.dc_buses
+                k == dc_slack && continue  # Skip DC slack bus for this island
+                
+                # Compute DC power injection at bus k: Pdc_calc = Vk * sum(Gkm * Vm)
+                Pdc_calc = 0.0
+                for m in island.dc_buses
+                    Pdc_calc += Gdc[k, m] * Vdc[m]
+                end
+                Pdc_calc *= Vdc[k]
+                
+                # Scheduled DC power (load + converter injections)
+                # Note: positive load convention (pd_mw > 0 = power consumed)
+                Pdc_sch = sys.dc_buses[k].pd_mw / baseMVA
+                for conv in sys.converters
+                    conv.in_service || continue
+                    if conv.bus_dc == k
+                        Pdc_sch += converter_dc_injection(conv, Vm, Va, Vdc, baseMVA, sys.loss_model)
+                    end
+                end
+                
+                ΔPdc = abs(Pdc_calc - Pdc_sch)
+                max_residual = max(max_residual, ΔPdc)
+            end
+        end
+        
+        island_converged = max_residual < options.tol
+        
         island_result = (
             island_id = island.id,
             ac_buses = island.ac_buses,
@@ -834,12 +959,44 @@ function solve_power_flow_islanded(sys::HybridSystem;
             Vm = result_global.Vm[island.ac_buses],
             Va = result_global.Va[island.ac_buses],
             Vdc = isempty(island.dc_buses) ? Float64[] : result_global.Vdc[island.dc_buses],
-            converged = result_global.converged
+            converged = island_converged,
+            residual = max_residual
         )
         push!(results, island_result)
     end
     
     return results
+end
+
+# ─── HybridPowerSystem Convenience Overloads ──────────────────────────────────
+
+"""
+    solve_power_flow_adaptive(hps::HybridPowerSystem; kwargs...) -> NamedTuple
+
+Solve power flow with adaptive island handling for a JuliaPowerCase HybridPowerSystem.
+Converts to HybridSystem internally and returns the same result format.
+
+See `solve_power_flow_adaptive(::HybridSystem)` for full documentation.
+"""
+function solve_power_flow_adaptive(hps::HybridPowerSystem; 
+                                   options::PowerFlowOptions=PowerFlowOptions(),
+                                   Q_limits::Dict{Int, ReactiveLimit}=Dict{Int, ReactiveLimit}())
+    sys = to_solver_system(hps)
+    return solve_power_flow_adaptive(sys; options=options, Q_limits=Q_limits)
+end
+
+"""
+    solve_power_flow_islanded(hps::HybridPowerSystem; kwargs...) -> Vector{NamedTuple}
+
+Solve each island independently for a JuliaPowerCase HybridPowerSystem.
+Converts to HybridSystem internally and returns the same result format.
+
+See `solve_power_flow_islanded(::HybridSystem)` for full documentation.
+"""
+function solve_power_flow_islanded(hps::HybridPowerSystem; 
+                                   options::PowerFlowOptions=PowerFlowOptions())
+    sys = to_solver_system(hps)
+    return solve_power_flow_islanded(sys; options=options)
 end
 
 # ─── Utility Functions ────────────────────────────────────────────────────────
@@ -854,7 +1011,7 @@ function create_default_Q_limits(sys::HybridSystem;
     Q_limits = Dict{Int, ReactiveLimit}()
     
     for (i, bus) in enumerate(sys.ac_buses)
-        if bus.type == PV
+        if bus.bus_type == PV
             Q_limits[i] = ReactiveLimit(Qmin_default, Qmax_default)
         end
     end
@@ -883,8 +1040,8 @@ function print_island_summary(islands::Vector{IslandInfo}, sys::HybridSystem)
         println("  DC slack bus: $(island.dc_slack_bus) (has_slack=$(island.has_dc_slack))")
         
         # Power balance
-        P_gen = sum(sys.ac_buses[i].Pg for i in island.ac_buses)
-        P_load = sum(sys.ac_buses[i].Pd for i in island.ac_buses)
+        P_gen = sum(sys.Pg[i] for i in island.ac_buses)
+        P_load = sum(sys.ac_buses[i].pd_mw / sys.baseMVA for i in island.ac_buses)
         println("  AC power: Gen=$(P_gen), Load=$(P_load), Balance=$(P_gen-P_load)")
     end
     println("="^70)
@@ -923,7 +1080,7 @@ function create_participation_factors(sys::HybridSystem; method=:capacity,
     if isempty(participating_buses)
         participating_buses = Int[]
         for (i, bus) in enumerate(sys.ac_buses)
-            if (bus.type == SLACK || bus.type == PV) && bus.Pg > 0
+            if (bus.bus_type == SLACK || bus.bus_type == PV) && sys.Pg[i] > 0
                 push!(participating_buses, i)
             end
         end
@@ -938,7 +1095,7 @@ function create_participation_factors(sys::HybridSystem; method=:capacity,
         max_P = Dict{Int,Float64}()
         for i in participating_buses
             # Use current Pg as proxy for capacity (could be enhanced)
-            capacity = sys.ac_buses[i].Pg > 0 ? sys.ac_buses[i].Pg : 1.0
+            capacity = sys.Pg[i] > 0 ? sys.Pg[i] : 1.0
             push!(raw_factors, capacity)
             max_P[i] = capacity * 1.5  # Allow 150% of current generation
         end
@@ -947,7 +1104,7 @@ function create_participation_factors(sys::HybridSystem; method=:capacity,
         raw_factors = Float64[]
         max_P = Dict{Int,Float64}()
         for i in participating_buses
-            capacity = sys.ac_buses[i].Pg > 0 ? sys.ac_buses[i].Pg : 1.0
+            capacity = sys.Pg[i] > 0 ? sys.Pg[i] : 1.0
             R_i = get(droop_coeffs, i, 0.0)
             factor = R_i > 0 ? 1.0 / R_i : capacity
             push!(raw_factors, factor)
@@ -974,6 +1131,13 @@ end
 
 Solve power flow with distributed slack bus model (capacity-based participation).
 
+!!! note "Simplified Implementation"
+    This uses a **post-distribution algorithm**: standard NR power flow is solved
+    first with a single reference bus, then slack power is distributed among
+    participating generators proportionally. This is equivalent to the full
+    distributed Jacobian approach for steady-state results but is computationally
+    simpler. For true distributed slack dynamics, use a specialized OPF formulation.
+
 Each island is solved independently with its own slack bus; no inter-island
 droop or AGC coupling is applied. Within a connected island, generators share
 the power mismatch proportionally to their participation factors α_i:
@@ -983,8 +1147,8 @@ the power mismatch proportionally to their participation factors α_i:
 # Algorithm
 1. Detect islands; skip dead islands (no generators)
 2. For each viable island, auto-assign a slack bus if missing
-3. Solve NR power flow per island
-4. Post-process to distribute slack among participating generators
+3. Solve standard NR power flow per island (single reference bus)
+4. Post-process to distribute slack power among participating generators
 
 # Arguments
 - `sys`: Hybrid power system
@@ -1004,14 +1168,14 @@ function solve_power_flow_distributed_slack(sys::HybridSystem,
     ndc = length(sys.dc_buses)
     
     # Initialize voltages
-    Vm = [b.Vm for b in sys.ac_buses]
+    Vm = [b.vm_pu for b in sys.ac_buses]
     Va = zeros(nac)
-    Vdc = [b.Vdc_set for b in sys.dc_buses]  # Use Vdc_set as initial guess
+    Vdc = [b.vm_pu for b in sys.dc_buses]  # Use vm_pu as initial guess
     
     # Identify bus types
-    slack_idx = [i for (i,b) in enumerate(sys.ac_buses) if b.type == SLACK]
-    pv_idx = [i for (i,b) in enumerate(sys.ac_buses) if b.type == PV]
-    pq_idx = [i for (i,b) in enumerate(sys.ac_buses) if b.type == PQ]
+    slack_idx = [i for (i,b) in enumerate(sys.ac_buses) if b.bus_type == SLACK]
+    pv_idx = [i for (i,b) in enumerate(sys.ac_buses) if b.bus_type == PV]
+    pq_idx = [i for (i,b) in enumerate(sys.ac_buses) if b.bus_type == PQ]
     
     # State variables: [Va (all except ref); Vm (PQ only); Vdc (all except 1)]
     # For distributed slack: all participating buses have unknown Va and Pg
@@ -1023,7 +1187,7 @@ function solve_power_flow_distributed_slack(sys::HybridSystem,
     non_ref_buses = [i for i in 1:nac if i != ref_bus]
     
     # PQ buses (unknown Vm)
-    pq_buses = [i for (i,b) in enumerate(sys.ac_buses) if b.type == PQ]
+    pq_buses = [i for (i,b) in enumerate(sys.ac_buses) if b.bus_type == PQ]
     
     # Number of equations
     np = length(non_ref_buses)  # P equations for non-reference buses
@@ -1041,7 +1205,7 @@ function solve_power_flow_distributed_slack(sys::HybridSystem,
     verbose && println("  Participation factors: $(dist_slack.participation_factors)")
     
     # Store initial generation
-    Pg_initial = Dict(i => sys.ac_buses[i].Pg for i in dist_slack.participating_buses)
+    Pg_initial = Dict(i => sys.Pg[i] for i in dist_slack.participating_buses)
     
     # Initialize F outside loop to avoid scope issues
     F = Float64[]
@@ -1051,15 +1215,16 @@ function solve_power_flow_distributed_slack(sys::HybridSystem,
         Pcalc, Qcalc = PowerSystem.ac_power_injections(sys, Vm, Va)
         
         # Scheduled injections
-        Psch = [sys.ac_buses[i].Pg - sys.ac_buses[i].Pd for i in 1:nac]
-        Qsch = [sys.ac_buses[i].Qg - sys.ac_buses[i].Qd for i in 1:nac]
+        baseMVA = sys.baseMVA
+        Psch = [sys.Pg[i] - sys.ac_buses[i].pd_mw / baseMVA for i in 1:nac]
+        Qsch = [sys.Qg[i] - sys.ac_buses[i].qd_mvar / baseMVA for i in 1:nac]
         
         # Add converter contributions
         for conv in sys.converters
-            conv.status || continue
-            Pac, Qac = converter_ac_injection(conv, Vm, Va, Vdc)
-            Psch[conv.ac_bus] += Pac
-            Qsch[conv.ac_bus] += Qac
+            conv.in_service || continue
+            Pac, Qac = converter_ac_injection(conv, Vm, Va, Vdc, baseMVA, sys.loss_model)
+            Psch[conv.bus_ac] += Pac
+            Qsch[conv.bus_ac] += Qac
         end
         
         # Power mismatch
@@ -1094,10 +1259,10 @@ function solve_power_flow_distributed_slack(sys::HybridSystem,
         # DC power equations
         if ndc > 1
             Pdc_calc = Vdc .* (sys.Gdc * Vdc)
-            Pdc_sch = [b.Pdc for b in sys.dc_buses]
+            Pdc_sch = [b.pd_mw / baseMVA for b in sys.dc_buses]
             for conv in sys.converters
-                conv.status || continue
-                Pdc_sch[conv.dc_bus] += converter_dc_injection(conv, Vm, Va, Vdc)
+                conv.in_service || continue
+                Pdc_sch[conv.bus_dc] += converter_dc_injection(conv, Vm, Va, Vdc, baseMVA, sys.loss_model)
             end
             for k in 1:(ndc-1)
                 push!(F, Pdc_calc[k+1] - Pdc_sch[k+1])
@@ -1114,7 +1279,7 @@ function solve_power_flow_distributed_slack(sys::HybridSystem,
             # Compute final participation summary
             P_slack = Dict{Int,Float64}()
             for i in dist_slack.participating_buses
-                P_slack[i] = sys.ac_buses[i].Pg - Pg_initial[i]
+                P_slack[i] = sys.Pg[i] - Pg_initial[i]
             end
             
             verbose && println("  Converged! Slack distribution: $P_slack")
@@ -1152,11 +1317,11 @@ function solve_power_flow_distributed_slack(sys::HybridSystem,
                     Pcalc_final[i] += Vm[i] * Vm[j] * (G[i,j] * cos(θij) + B[i,j] * sin(θij))
                 end
                 
-                Psch_final = [sys.ac_buses[i].Pg - sys.ac_buses[i].Pd for i in 1:nac]
+                Psch_final = [sys.Pg[i] - sys.ac_buses[i].pd_mw / baseMVA for i in 1:nac]
                 for conv in sys.converters
-                    conv.status || continue
-                    Pac, _ = converter_ac_injection(conv, Vm, Va, Vdc)
-                    Psch_final[conv.ac_bus] += Pac
+                    conv.in_service || continue
+                    Pac, _ = converter_ac_injection(conv, Vm, Va, Vdc, baseMVA, sys.loss_model)
+                    Psch_final[conv.bus_ac] += Pac
                 end
                 
                 # Compute slack at each participating bus
@@ -1247,15 +1412,15 @@ function solve_power_flow_distributed_slack_full(sys::HybridSystem,
     ndc = length(sys.dc_buses)
     
     # Initialize voltages
-    Vm = [b.Vm for b in sys.ac_buses]
+    Vm = [b.vm_pu for b in sys.ac_buses]
     Va = zeros(nac)
-    Vdc = [b.Vdc_set for b in sys.dc_buses]
+    Vdc = [b.vm_pu for b in sys.dc_buses]
     
     # Initialize total slack power (single variable)
     λ_slack = 0.0
     
     # Identify bus types
-    pq_idx = [i for (i,b) in enumerate(sys.ac_buses) if b.type == PQ]
+    pq_idx = [i for (i,b) in enumerate(sys.ac_buses) if b.bus_type == PQ]
     
     participating_set = Set(dist_slack.participating_buses)
     ref_bus = dist_slack.reference_bus
@@ -1277,7 +1442,7 @@ function solve_power_flow_distributed_slack_full(sys::HybridSystem,
     verbose && println("  Enforce limits: $(enforce_limits)")
     
     # Store initial generation
-    Pg_initial = Dict(i => sys.ac_buses[i].Pg for i in dist_slack.participating_buses)
+    Pg_initial = Dict(i => sys.Pg[i] for i in dist_slack.participating_buses)
     
     last_residual = Inf  # Track residual for non-convergence case
     
@@ -1286,11 +1451,12 @@ function solve_power_flow_distributed_slack_full(sys::HybridSystem,
         Pcalc, Qcalc = PowerSystem.ac_power_injections(sys, Vm, Va)
         
         # Scheduled injections
+        baseMVA = sys.baseMVA
         Psch = zeros(nac)
         Qsch = zeros(nac)
         for i in 1:nac
-            Psch[i] = sys.ac_buses[i].Pg - sys.ac_buses[i].Pd
-            Qsch[i] = sys.ac_buses[i].Qg - sys.ac_buses[i].Qd
+            Psch[i] = sys.Pg[i] - sys.ac_buses[i].pd_mw / baseMVA
+            Qsch[i] = sys.Qg[i] - sys.ac_buses[i].qd_mvar / baseMVA
             
             # Add distributed slack contribution: ΔPg_i = α_i × λ_slack
             if i in participating_set && !(i in hit_limits)
@@ -1304,10 +1470,10 @@ function solve_power_flow_distributed_slack_full(sys::HybridSystem,
         
         # Converter contributions
         for conv in sys.converters
-            conv.status || continue
-            Pac, Qac = converter_ac_injection(conv, Vm, Va, Vdc)
-            Psch[conv.ac_bus] += Pac
-            Qsch[conv.ac_bus] += Qac
+            conv.in_service || continue
+            Pac, Qac = converter_ac_injection(conv, Vm, Va, Vdc, baseMVA, sys.loss_model)
+            Psch[conv.bus_ac] += Pac
+            Qsch[conv.bus_ac] += Qac
         end
         
         # Power mismatches
@@ -1318,10 +1484,10 @@ function solve_power_flow_distributed_slack_full(sys::HybridSystem,
         ΔP_dc = Float64[]
         if ndc > 1
             Pdc_calc = Vdc .* (sys.Gdc * Vdc)
-            Pdc_sch = [b.Pdc for b in sys.dc_buses]
+            Pdc_sch = [b.pd_mw / baseMVA for b in sys.dc_buses]
             for conv in sys.converters
-                conv.status || continue
-                Pdc_sch[conv.dc_bus] += converter_dc_injection(conv, Vm, Va, Vdc)
+                conv.in_service || continue
+                Pdc_sch[conv.bus_dc] += converter_dc_injection(conv, Vm, Va, Vdc, baseMVA, sys.loss_model)
             end
             ΔP_dc = Pdc_calc[2:end] .- Pdc_sch[2:end]
         end
@@ -1612,6 +1778,44 @@ function solve_power_flow_distributed_slack_full(sys::HybridSystem,
     return (Vm=Vm, Va=Va, Vdc=Vdc, converged=false, iterations=max_iter,
            residual=last_residual, distributed_slack_P=Dict{Int,Float64}(),
            total_slack_P=0.0, hit_limits=collect(hit_limits))
+end
+
+# ─── HybridPowerSystem Distributed Slack Overloads ────────────────────────────
+
+"""
+    solve_power_flow_distributed_slack(hps::HybridPowerSystem, dist_slack; kwargs...)
+
+Distributed slack solver for JuliaPowerCase HybridPowerSystem.
+Converts to HybridSystem internally.
+
+See `solve_power_flow_distributed_slack(::HybridSystem, ...)` for full documentation.
+"""
+function solve_power_flow_distributed_slack(hps::HybridPowerSystem, 
+                                            dist_slack::DistributedSlack;
+                                            max_iter::Int=50,
+                                            tol::Float64=1e-8,
+                                            verbose::Bool=false)
+    sys = to_solver_system(hps)
+    return solve_power_flow_distributed_slack(sys, dist_slack; 
+                                              max_iter=max_iter, tol=tol, verbose=verbose)
+end
+
+"""
+    solve_power_flow_distributed_slack_full(hps::HybridPowerSystem, dist_slack; kwargs...)
+
+Full distributed slack solver for JuliaPowerCase HybridPowerSystem.
+Converts to HybridSystem internally.
+
+See `solve_power_flow_distributed_slack_full(::HybridSystem, ...)` for full documentation.
+"""
+function solve_power_flow_distributed_slack_full(hps::HybridPowerSystem, 
+                                                 dist_slack::DistributedSlack;
+                                                 max_iter::Int=50,
+                                                 tol::Float64=1e-8,
+                                                 verbose::Bool=false)
+    sys = to_solver_system(hps)
+    return solve_power_flow_distributed_slack_full(sys, dist_slack; 
+                                                   max_iter=max_iter, tol=tol, verbose=verbose)
 end
 
 end  # module PowerSystemEnhanced

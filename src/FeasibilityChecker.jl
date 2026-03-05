@@ -88,3 +88,22 @@ function check_power_flow_feasibility(sys; method::Symbol=:nlsolve, verbose::Boo
         error("Unknown feasibility check method: $method (use :nlsolve or :jump)")
     end
 end
+
+# Validation function stubs (implemented in FeasibilityExt)
+function validate_against_nlsolve(sys; kwargs...)
+    error("""
+        validate_against_nlsolve requires NLsolve.
+        Please load NLsolve first:
+            using NLsolve
+        Then the extension will be automatically loaded.
+        """)
+end
+
+function validate_against_jump(sys; kwargs...)
+    error("""
+        validate_against_jump requires JuMP and Ipopt.
+        Please load them first:
+            using JuMP, Ipopt
+        Then the extension will be automatically loaded.
+        """)
+end

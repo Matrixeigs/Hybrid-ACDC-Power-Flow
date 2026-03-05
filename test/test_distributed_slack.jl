@@ -11,7 +11,12 @@ Tests:
 """
 
 using Test
-using HybridACDCPowerFlow
+
+# Load module
+if !isdefined(Main, :HybridACDCPowerFlow)
+    include("../src/HybridACDCPowerFlow.jl")
+    using .HybridACDCPowerFlow
+end
 
 println("="^70)
 println("DISTRIBUTED SLACK BUS MODEL TESTS (v0.3.0)")

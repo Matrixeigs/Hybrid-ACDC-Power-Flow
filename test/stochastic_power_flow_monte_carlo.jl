@@ -29,8 +29,9 @@ using Printf
 using Dates
 using LinearAlgebra
 
-using HybridACDCPowerFlow
-using HybridACDCPowerFlow: PQ_MODE, VDC_Q, VDC_VAC, ACBus, ACBranch, VSCConverter
+include("../src/HybridACDCPowerFlow.jl")
+using .HybridACDCPowerFlow
+using .HybridACDCPowerFlow: PQ_MODE, VDC_Q, VDC_VAC, ACBus, ACBranch, VSCConverter
 
 # Ensure output directories exist
 mkpath("results/monte_carlo")
