@@ -1,15 +1,17 @@
 name = "HybridACDCPowerFlow"
 uuid = "a1b2c3d4-e5f6-7890-abcd-ef1234567890"
 authors = ["Tianyang Zhao"]
-version = "0.5.0"
+version = "0.6.0"
 
 [deps]
 BenchmarkTools = "6e4b80f9-dd63-53aa-95a3-0cdb28fa8baf"
 JuliaPowerCase = "282df8d2-81ff-4c7e-bece-5e6c4325ba02"
 LinearAlgebra = "37e2e46d-f89d-539d-b4ee-838fcccc9c8e"
+LoopVectorization = "bdcacae8-1622-11e9-2a5c-532679323890"
 Printf = "de0858da-6303-5e67-8744-51eddeeeb8d7"
 Random = "9a3f8284-a2c9-5f02-9a11-845980a1fd5c"
 SparseArrays = "2f01184e-e22b-5df5-ae63-d93ebab69eaf"
+StaticArrays = "90137ffa-7385-5640-81b9-e52037218182"
 Statistics = "10745b16-79ce-11e8-11f9-7d13ad32a3b2"
 Test = "8dfed614-e22c-5e08-85e1-65c5234f0b40"
 
@@ -24,5 +26,7 @@ FeasibilityExt = ["JuMP", "Ipopt", "NLsolve"]
 [compat]
 Ipopt = "1"
 JuMP = "1"
+LoopVectorization = "0.12"
 NLsolve = "4"
+StaticArrays = "1"
 julia = "1.9"

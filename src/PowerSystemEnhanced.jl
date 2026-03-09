@@ -3,14 +3,14 @@
 
 Enhanced hybrid AC/DC power system solver with:
 - Multiple islanded systems detection and handling
-- PV → PQ conversion when reactive power limits are violated
+- PV → PQ conversion when reactive power limits are violated  
 - Multiple swing bus handling (AC and DC)
 - Automatic converter control mode switching
 - Distributed slack bus model for realistic power sharing
 - Advanced Newton-Raphson with adaptive control
 
 Author: Tianyang Zhao
-Version: 0.5.0 (JuliaPowerCase Integration)
+Version: 0.7.0 (Refactored for pure application layer)
 """
 module PowerSystemEnhanced
 
@@ -18,11 +18,12 @@ using LinearAlgebra, SparseArrays, Printf
 
 # Re-export everything from base PowerSystem
 using ..PowerSystem
-using ..PowerSystem: ACBus, ACBranch, DCBus, DCBranch, VSCConverter, HybridSystem, Generator,
-                     HybridPowerSystem, IslandInfo, to_solver_system,
+using ..PowerSystem: ACBus, ACBranch, DCBus, DCBranch, VSCConverter, SolverData, Generator,
+                     HybridPowerSystem, IslandInfo, to_solver_data,
                      BusType, PQ, PV, SLACK, PQ_MODE, VDC_Q, VDC_VAC,
                      build_admittance_matrix, converter_loss, solve_power_flow,
                      converter_ac_injection, converter_dc_injection,
+                     rebuild_matrices!,
                      jpc_detect_islands, jpc_extract_island_subsystem
 
 export detect_islands, solve_power_flow_islanded, solve_power_flow_adaptive,
@@ -106,7 +107,7 @@ end
 # ─── Island Detection ─────────────────────────────────────────────────────────
 
 """
-    detect_islands(sys::HybridSystem) -> Vector{IslandInfo}
+    detect_islands(sys::SolverData) -> Vector{IslandInfo}
 
 Detect all electrically isolated islands in the hybrid AC/DC system.
 
@@ -118,7 +119,7 @@ assigned to the same island as the rest of the network.
 DC buses are represented as nodes (nac+1):(nac+ndc) in the internal graph.
 """
 
-function detect_islands(sys::HybridSystem)
+function detect_islands(sys::SolverData)
     nac = length(sys.ac_buses)
     ndc = length(sys.dc_buses)
     n_total = nac + ndc
@@ -242,7 +243,7 @@ extract_island_subsystem(hps::HybridPowerSystem, island::IslandInfo; slack_bus_o
 # ─── Island Sub-system Extraction ─────────────────────────────────────────────
 
 """
-    extract_island_subsystem(sys::HybridSystem, island::IslandInfo; slack_bus_override=0)
+    extract_island_subsystem(sys::SolverData, island::IslandInfo; slack_bus_override=0)
         -> (sub_sys, ac_map, dc_map)
 
 Extract a standalone `HybridSystem` for a single island.
@@ -268,7 +269,7 @@ for isl in islands
 end
 ```
 """
-function extract_island_subsystem(sys::HybridSystem, island::IslandInfo; slack_bus_override::Int=0)
+function extract_island_subsystem(sys::SolverData, island::IslandInfo; slack_bus_override::Int=0)
     # Build index maps:  original → local (1-based)
     ac_map = Dict{Int,Int}()
     for (local_idx, orig_idx) in enumerate(sort(island.ac_buses))
@@ -358,7 +359,7 @@ function extract_island_subsystem(sys::HybridSystem, island::IslandInfo; slack_b
     end
 
     # ── Build sub-system (automatically builds Ybus & Gdc) ───────────
-    sub_sys = HybridSystem(sub_ac_buses, sub_ac_branches,
+    sub_sys = SolverData(sub_ac_buses, sub_ac_branches,
                            sub_dc_buses, sub_dc_branches,
                            sub_converters; generators=sub_generators, baseMVA=sys.baseMVA)
 
@@ -381,7 +382,7 @@ When Q_i exceeds limits, the bus must be converted to PQ type:
 - If Q_i > Q_{max}: set Q_i = Q_{max}, solve for |V_i|
 - If Q_i < Q_{min}: set Q_i = Q_{min}, solve for |V_i|
 """
-function check_reactive_limits(sys::HybridSystem, Vm::Vector{Float64}, 
+function check_reactive_limits(sys::SolverData, Vm::Vector{Float64}, 
                                Va::Vector{Float64}, Vdc::Vector{Float64},
     Q_limits::Dict{Int, ReactiveLimit})
     nac = length(sys.ac_buses)
@@ -431,7 +432,7 @@ Modifies system in-place.
 2. Re-solve power flow with new PQ buses
 3. Iterate until no violations (or max iterations reached)
 """
-function pv_to_pq_conversion!(sys::HybridSystem, violations::Vector{Tuple{Int, Symbol, Float64}},
+function pv_to_pq_conversion!(sys::SolverData, violations::Vector{Tuple{Int, Symbol, Float64}},
                               Q_limits::Dict{Int, ReactiveLimit})
     converted = Int[]
     
@@ -483,7 +484,7 @@ The slack bus provides voltage and angle reference:
 If the island has generators but no SLACK bus, the bus with the largest 
 online generation capacity is automatically promoted to SLACK.
 """
-function auto_select_swing_bus(sys::HybridSystem, island::IslandInfo)
+function auto_select_swing_bus(sys::SolverData, island::IslandInfo)
     buses_in_island = island.ac_buses
     isempty(buses_in_island) && return 0
     
@@ -517,7 +518,7 @@ Select DC slack bus (voltage reference for DC network).
 1. DC bus connected to VDC_Q or VDC_VAC converter (voltage-controlling)
 2. First DC bus in island
 """
-function auto_select_dc_slack_bus(sys::HybridSystem, island::IslandInfo)
+function auto_select_dc_slack_bus(sys::SolverData, island::IslandInfo)
     dc_buses_in_island = island.dc_buses
     
     # Priority 1: DC bus with voltage-controlling converter
@@ -548,7 +549,7 @@ Automatically switch converter control modes based on operating conditions.
 
 # Returns indices of converters that were switched
 """
-function auto_switch_converter_mode!(sys::HybridSystem, Vm::Vector{Float64}, 
+function auto_switch_converter_mode!(sys::SolverData, Vm::Vector{Float64}, 
                                      Va::Vector{Float64}, Vdc::Vector{Float64};
                                      V_low_threshold=0.95, V_high_threshold=1.05,
                                      S_limit_frac=0.95)
@@ -623,7 +624,7 @@ Advanced power flow solver with:
    f. Map results back to global voltage arrays
 3. Combine results from all islands
 """
-function solve_power_flow_adaptive(sys::HybridSystem; 
+function solve_power_flow_adaptive(sys::SolverData; 
                                    options::PowerFlowOptions=PowerFlowOptions(),
                                    Q_limits::Dict{Int, ReactiveLimit}=Dict{Int, ReactiveLimit}())
     
@@ -861,7 +862,7 @@ end
 Solve each island independently using sub-system extraction and return
 per-island results. Useful for post-fault analysis where system fragments.
 """
-function solve_power_flow_islanded(sys::HybridSystem; 
+function solve_power_flow_islanded(sys::SolverData; 
                                    options::PowerFlowOptions=PowerFlowOptions())
     islands = detect_islands(sys)
     result_global = solve_power_flow_adaptive(sys; options=options)
@@ -976,12 +977,12 @@ end
 Solve power flow with adaptive island handling for a JuliaPowerCase HybridPowerSystem.
 Converts to HybridSystem internally and returns the same result format.
 
-See `solve_power_flow_adaptive(::HybridSystem)` for full documentation.
+See `solve_power_flow_adaptive(::SolverData)` for full documentation.
 """
 function solve_power_flow_adaptive(hps::HybridPowerSystem; 
                                    options::PowerFlowOptions=PowerFlowOptions(),
                                    Q_limits::Dict{Int, ReactiveLimit}=Dict{Int, ReactiveLimit}())
-    sys = to_solver_system(hps)
+    sys = to_solver_data(hps)
     return solve_power_flow_adaptive(sys; options=options, Q_limits=Q_limits)
 end
 
@@ -991,11 +992,11 @@ end
 Solve each island independently for a JuliaPowerCase HybridPowerSystem.
 Converts to HybridSystem internally and returns the same result format.
 
-See `solve_power_flow_islanded(::HybridSystem)` for full documentation.
+See `solve_power_flow_islanded(::SolverData)` for full documentation.
 """
 function solve_power_flow_islanded(hps::HybridPowerSystem; 
                                    options::PowerFlowOptions=PowerFlowOptions())
-    sys = to_solver_system(hps)
+    sys = to_solver_data(hps)
     return solve_power_flow_islanded(sys; options=options)
 end
 
@@ -1006,7 +1007,7 @@ end
 
 Create default reactive power limits for all PV buses in the system.
 """
-function create_default_Q_limits(sys::HybridSystem; 
+function create_default_Q_limits(sys::SolverData; 
                                 Qmin_default=-0.5, Qmax_default=0.5)
     Q_limits = Dict{Int, ReactiveLimit}()
     
@@ -1024,7 +1025,7 @@ end
 
 Print detailed summary of all detected islands.
 """
-function print_island_summary(islands::Vector{IslandInfo}, sys::HybridSystem)
+function print_island_summary(islands::Vector{IslandInfo}, sys::SolverData)
     println("\n" * "="^70)
     println("ISLAND DETECTION SUMMARY")
     println("="^70)
@@ -1050,7 +1051,7 @@ end
 # ─── Distributed Slack Bus Model ──────────────────────────────────────────────
 
 """
-    create_participation_factors(sys::HybridSystem; method=:capacity) -> DistributedSlack
+    create_participation_factors(sys::SolverData; method=:capacity) -> DistributedSlack
 
 Automatically create participation factors for distributed slack model.
 Each island's generators participate independently — no inter-island
@@ -1073,7 +1074,7 @@ dist_slack = create_participation_factors(sys; method=:capacity)
 result = solve_power_flow_distributed_slack(sys, dist_slack)
 ```
 """
-function create_participation_factors(sys::HybridSystem; method=:capacity,
+function create_participation_factors(sys::SolverData; method=:capacity,
                                      participating_buses::Vector{Int}=Int[],
                                      droop_coeffs::Dict{Int,Float64}=Dict{Int,Float64}())
     # If no buses specified, use all slack and PV buses with nonzero capacity
@@ -1126,7 +1127,7 @@ function create_participation_factors(sys::HybridSystem; method=:capacity,
 end
 
 """
-    solve_power_flow_distributed_slack(sys::HybridSystem, dist_slack::DistributedSlack; 
+    solve_power_flow_distributed_slack(sys::SolverData, dist_slack::DistributedSlack; 
                                        max_iter=50, tol=1e-8, verbose=false)
 
 Solve power flow with distributed slack bus model (capacity-based participation).
@@ -1160,7 +1161,7 @@ the power mismatch proportionally to their participation factors α_i:
 # Returns
 Named tuple with converged solution including participation summary.
 """
-function solve_power_flow_distributed_slack(sys::HybridSystem, 
+function solve_power_flow_distributed_slack(sys::SolverData, 
                                            dist_slack::DistributedSlack;
                                            max_iter=50, tol=1e-8, verbose=false)
     rebuild_matrices!(sys)
@@ -1356,7 +1357,7 @@ function solve_power_flow_distributed_slack(sys::HybridSystem,
 end
 
 """
-    solve_power_flow_distributed_slack_full(sys::HybridSystem, dist_slack::DistributedSlack;
+    solve_power_flow_distributed_slack_full(sys::SolverData, dist_slack::DistributedSlack;
                                             max_iter=50, tol=1e-8, verbose=false,
                                             enforce_limits=true)
 
@@ -1403,7 +1404,7 @@ Dimensionally correct: (n_P + n_Q + n_DC) equations = (n_P + n_Q + n_DC) variabl
 - No post-processing needed
 - Quadratic convergence rate
 """
-function solve_power_flow_distributed_slack_full(sys::HybridSystem, 
+function solve_power_flow_distributed_slack_full(sys::SolverData, 
                                                  dist_slack::DistributedSlack;
                                                  max_iter=50, tol=1e-8, 
                                                  verbose=false, enforce_limits=true)
@@ -1788,14 +1789,14 @@ end
 Distributed slack solver for JuliaPowerCase HybridPowerSystem.
 Converts to HybridSystem internally.
 
-See `solve_power_flow_distributed_slack(::HybridSystem, ...)` for full documentation.
+See `solve_power_flow_distributed_slack(::SolverData, ...)` for full documentation.
 """
 function solve_power_flow_distributed_slack(hps::HybridPowerSystem, 
                                             dist_slack::DistributedSlack;
                                             max_iter::Int=50,
                                             tol::Float64=1e-8,
                                             verbose::Bool=false)
-    sys = to_solver_system(hps)
+    sys = to_solver_data(hps)
     return solve_power_flow_distributed_slack(sys, dist_slack; 
                                               max_iter=max_iter, tol=tol, verbose=verbose)
 end
@@ -1806,14 +1807,14 @@ end
 Full distributed slack solver for JuliaPowerCase HybridPowerSystem.
 Converts to HybridSystem internally.
 
-See `solve_power_flow_distributed_slack_full(::HybridSystem, ...)` for full documentation.
+See `solve_power_flow_distributed_slack_full(::SolverData, ...)` for full documentation.
 """
 function solve_power_flow_distributed_slack_full(hps::HybridPowerSystem, 
                                                  dist_slack::DistributedSlack;
                                                  max_iter::Int=50,
                                                  tol::Float64=1e-8,
                                                  verbose::Bool=false)
-    sys = to_solver_system(hps)
+    sys = to_solver_data(hps)
     return solve_power_flow_distributed_slack_full(sys, dist_slack; 
                                                    max_iter=max_iter, tol=tol, verbose=verbose)
 end

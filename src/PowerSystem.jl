@@ -1,23 +1,41 @@
 """
     PowerSystem.jl
 
-Hybrid AC/DC power system solver fully based on JuliaPowerCase data model.
-Supports: AC power flow, DC network, VSC converters with multiple control modes.
+Hybrid AC/DC power flow solver module for JuliaPowerCase data model.
 
-Architecture:
-- ALL data types (ACBus, ACBranch, DCBus, DCBranch, VSCConverter, Generator)
-  are imported from JuliaPowerCase — no local type redefinition.
-- BusType aliases: PQ=PQ_BUS, PV=PV_BUS, SLACK=REF_BUS
-- Converter control modes use Symbol (:pq, :vdc_q, :vdc_vac) matching
-  JuliaPowerCase.VSCConverter.control_mode.
-- HybridSystem wraps JuliaPowerCase component vectors with pre-computed
-  admittance matrices and aggregated generator injections.
+# Architecture (v0.6.0 - Pure Application Layer)
+This module is a pure *application* layer that operates on data structures 
+from JuliaPowerCase (the *information* layer).
 
-v0.5.0: Full JuliaPowerCase inheritance
+## Data Flow
+```
+JuliaPowerCase.HybridPowerSystem (data)
+         ↓ (to_solver_system)
+   SolverData (internal workspace)
+         ↓ (solve_power_flow)
+    Results stored back in HybridPowerSystem
+```
+
+## Key Design Principles
+1. **No data type definitions** - All types imported from JuliaPowerCase
+2. **Input**: `HybridPowerSystem` from JuliaPowerCase 
+3. **Internal**: `SolverData` workspace (not exported)
+4. **Output**: Results written back to input data structure
+
+## Supported Features
+- AC power flow with Newton-Raphson solver
+- DC network with linear analysis  
+- VSC converters with multiple control modes (PQ, VDC_Q, VDC_VAC)
+- Sparse Jacobian with pre-allocated workspace
+- Island detection and adaptive solving
+
+v0.6.0: Refactored as pure application layer (data from JuliaPowerCase)
 """
 module PowerSystem
 
 using LinearAlgebra, SparseArrays
+using LoopVectorization: @turbo
+using StaticArrays: SVector, SMatrix, @SVector, @SMatrix
 using JuliaPowerCase: Bus, Branch, Generator,
                       VSCConverter, PowerSystem as JPCPowerSystem,
                       HybridPowerSystem,
@@ -29,23 +47,24 @@ using JuliaPowerCase: Bus, Branch, Generator,
                       extract_island_subsystem as jpc_extract_island_subsystem,
                       IslandInfo
 
-export ACBus, ACBranch, DCBus, DCBranch, VSCConverter, HybridSystem, Generator,
+# Re-export JuliaPowerCase types for convenient access
+export ACBus, ACBranch, DCBus, DCBranch, VSCConverter, Generator,
        HybridPowerSystem, IslandInfo,
-       BusType, PQ, PV, SLACK, PQ_MODE, VDC_Q, VDC_VAC,
-       build_admittance_matrix, solve_power_flow, power_flow_residual,
-       get_bus_voltages, get_branch_flows, rebuild_matrices!,
-       remove_ac_branch, extract_graph_data,
-       # Conversion
-       to_solver_system,
-       # Optimization exports
-       SolverWorkspace, create_solver_workspace, build_jacobian_triplets!,
-       compute_power_injections!, compute_residual!,
-       # Residual utilities (for external reuse)
-       full_residual_simple,
+       BusType, PQ, PV, SLACK, DC_V, DC_P, PQ_MODE, VDC_Q, VDC_VAC,
+       # Main solver functions
+       solve_power_flow, solve_dc_power_flow, power_flow_residual,
+       get_bus_voltages, get_branch_flows,
+       # Conversion (limited - internal use mostly)
+       to_solver_data,
+       # Utility functions that may be needed externally
+       rebuild_matrices!, full_residual_simple,
        # Topology functions from JuliaPowerCase
        jpc_detect_islands, jpc_extract_island_subsystem,
        # Loss model types
        LossModelType, LINEAR_LOSS, CURRENT_BASED_LOSS
+
+# NOTE: SolverData (formerly HybridSystem) and SolverWorkspace are INTERNAL and not exported
+# Users should interact with HybridPowerSystem from JuliaPowerCase
 
 # ═══════════════════════════════════════════════════════════════════════════════
 #  BUS TYPE ALIASES (from JuliaPowerCase)
@@ -54,6 +73,15 @@ export ACBus, ACBranch, DCBus, DCBranch, VSCConverter, HybridSystem, Generator,
 const PQ = PQ_BUS
 const PV = PV_BUS
 const SLACK = REF_BUS
+
+# DC bus type aliases (using BusType enum for DC buses)
+# - DC_V: Voltage-controlled DC bus (reference/slack)
+# - DC_P: Power-controlled DC bus
+"""DC voltage reference bus (uses REF_BUS from BusType)."""
+const DC_V = REF_BUS
+
+"""DC power-specified bus (uses PQ_BUS from BusType)."""
+const DC_P = PQ_BUS
 
 # ═══════════════════════════════════════════════════════════════════════════════
 #  CONVERTER CONTROL MODE (Symbol constants matching JuliaPowerCase)
@@ -82,55 +110,61 @@ Enumeration for converter loss model selection.
 end
 
 # ═══════════════════════════════════════════════════════════════════════════════
-#  HYBRID SYSTEM (uses JuliaPowerCase types)
+#  SOLVER DATA (Internal Workspace - uses JuliaPowerCase types)
 # ═══════════════════════════════════════════════════════════════════════════════
 
 """
-    HybridSystem
+    SolverData
 
-Container for hybrid AC/DC power system using JuliaPowerCase data types.
+Internal solver workspace for hybrid AC/DC power flow analysis.
+NOT EXPORTED - users should work with `HybridPowerSystem` from JuliaPowerCase.
 
-Fields use JuliaPowerCase types directly:
-- `ac_buses::Vector{ACBus}` — Bus{AC} from JuliaPowerCase (21 fields)
-- `ac_branches::Vector{ACBranch}` — Branch{AC} from JuliaPowerCase (34 fields)
-- `dc_buses::Vector{DCBus}` — Bus{DC} from JuliaPowerCase (21 fields)
-- `dc_branches::Vector{DCBranch}` — Branch{DC} from JuliaPowerCase (34 fields)
-- `converters::Vector{VSCConverter}` — VSCConverter from JuliaPowerCase (34 fields)
-- `generators::Vector{Generator}` — Generator from JuliaPowerCase
-- `Pg`, `Qg` — aggregated generation per AC bus (p.u.)
+This struct wraps component data from JuliaPowerCase with solver-specific cached values:
+- Component references (busesConverters from HybridPowerSystem)
+- Computed matrices (Ybus, Gdc)
+- Aggregated data (Pg, Qg per bus)
 
-Unit convention:
-- JuliaPowerCase stores power in MW/MVar, voltage in p.u., angle in degrees
-- Solver converts to p.u. using baseMVA and to radians internally
+# Fields
+- `ac_buses::Vector{ACBus}` — references to AC buses from JuliaPowerCase
+- `ac_branches::Vector{ACBranch}` — references to AC branches from JuliaPowerCase
+- `dc_buses::Vector{DCBus}` — references to DC buses from JuliaPowerCase
+- `dc_branches::Vector{DCBranch}` — references to DC branches from JuliaPowerCase  
+- `converters::Vector{VSCConverter}` — references to converters from JuliaPowerCase
+- `generators::Vector{Generator}` — references to generators from JuliaPowerCase
+- `baseMVA::Float64` — base power for per-unit conversion
+- `Pg, Qg::Vector{Float64}` — aggregated generation per AC bus (p.u.)
+- `Ybus::SparseMatrixCSC{ComplexF64}` — AC bus admittance matrix
+- `Gdc::SparseMatrixCSC{Float64}` — DC bus conductance matrix
+- `loss_model::LossModelType` — converter loss model selection
+
+# Constructor
+    SolverData(hps::HybridPowerSystem; loss_model=LINEAR_LOSS)
+
+Create solver workspace from a JuliaPowerCase `HybridPowerSystem`.
 """
-mutable struct HybridSystem
-    # AC network (JuliaPowerCase types)
+mutable struct SolverData
+    # Component references (from JuliaPowerCase, not owned)
     ac_buses::Vector{ACBus}
     ac_branches::Vector{ACBranch}
     baseMVA::Float64
-    # DC network (JuliaPowerCase types)
     dc_buses::Vector{DCBus}
     dc_branches::Vector{DCBranch}
-    # Converters (JuliaPowerCase type)
     converters::Vector{VSCConverter}
-    # Generators (JuliaPowerCase type)
     generators::Vector{Generator}
-    # Aggregated generation per AC bus (p.u. on baseMVA)
+    # Cached solver data
     Pg::Vector{Float64}
     Qg::Vector{Float64}
-    # Computed matrices (sparse)
     Ybus::Union{Nothing, SparseMatrixCSC{ComplexF64, Int}}
     Gdc::Union{Nothing, SparseMatrixCSC{Float64, Int}}
-    # Converter loss model selection
     loss_model::LossModelType
 end
 
 """
-    aggregate_generation!(sys::HybridSystem)
+    aggregate_generation!(sys::SolverData)
 
 Aggregate generator active/reactive power into per-bus Pg/Qg vectors (p.u.).
 """
-function aggregate_generation!(sys::HybridSystem)
+function aggregate_generation!(sys::SolverData)
     nac = length(sys.ac_buses)
     fill!(sys.Pg, 0.0)
     fill!(sys.Qg, 0.0)
@@ -144,21 +178,21 @@ function aggregate_generation!(sys::HybridSystem)
     end
 end
 
-function HybridSystem(ac_buses, ac_branches, dc_buses, dc_branches, converters;
-                      generators=Generator[], baseMVA=100.0, 
-                      loss_model::LossModelType=LINEAR_LOSS)
+function SolverData(ac_buses, ac_branches, dc_buses, dc_branches, converters;
+                    generators=Generator[], baseMVA=100.0, 
+                    loss_model::LossModelType=LINEAR_LOSS)
     nac = length(ac_buses)
     Pg = zeros(nac)
     Qg = zeros(nac)
-    sys = HybridSystem(ac_buses, ac_branches, baseMVA, dc_buses, dc_branches,
-                       converters, generators, Pg, Qg, nothing, nothing, loss_model)
+    sys = SolverData(ac_buses, ac_branches, baseMVA, dc_buses, dc_branches,
+                     converters, generators, Pg, Qg, nothing, nothing, loss_model)
     aggregate_generation!(sys)
     sys.Ybus = build_admittance_matrix(sys)
     sys.Gdc = build_dc_conductance(sys)
     return sys
 end
 
-function rebuild_matrices!(sys::HybridSystem)
+function rebuild_matrices!(sys::SolverData)
     aggregate_generation!(sys)
     sys.Ybus = build_admittance_matrix(sys)
     sys.Gdc = build_dc_conductance(sys)
@@ -166,26 +200,26 @@ function rebuild_matrices!(sys::HybridSystem)
 end
 
 # ═══════════════════════════════════════════════════════════════════════════════
-#  CONVERSION: HybridPowerSystem → HybridSystem (solver-ready)
+#  CONVERSION: HybridPowerSystem → SolverData (solver-ready)
 # ═══════════════════════════════════════════════════════════════════════════════
 
 """
-    to_solver_system(hps::HybridPowerSystem) -> HybridSystem
+    to_solver_data(hps::HybridPowerSystem; loss_model=LINEAR_LOSS) -> SolverData
 
-Convert a JuliaPowerCase `HybridPowerSystem` to a solver-ready `HybridSystem`
+Convert a JuliaPowerCase `HybridPowerSystem` to internal solver workspace
 with pre-computed admittance matrices.
 
-This is the recommended way to prepare a system for power flow analysis:
+This is called automatically by `solve_power_flow(hps)`, so users typically
+don't need to call this directly.
 
 # Example
 ```julia
-using JuliaPowerCase
+using JuliaPowerCase, HybridACDCPowerFlow
 hps = HybridPowerSystem(...)  # Define your system using JuliaPowerCase types
-sys = to_solver_system(hps)   # Convert to solver format
-result = solve_power_flow(sys)
+result = solve_power_flow(hps)  # Automatically creates solver workspace
 ```
 """
-function to_solver_system(hps::HybridPowerSystem)
+function to_solver_data(hps::HybridPowerSystem; loss_model::LossModelType=LINEAR_LOSS)
     # Extract components from nested structure
     ac_buses = hps.ac.buses
     ac_branches = hps.ac.branches
@@ -195,23 +229,24 @@ function to_solver_system(hps::HybridPowerSystem)
     generators = hps.ac.generators
     baseMVA = hps.base_mva
     
-    return HybridSystem(ac_buses, ac_branches, dc_buses, dc_branches, converters;
-                        generators=generators, baseMVA=baseMVA)
+    return SolverData(ac_buses, ac_branches, dc_buses, dc_branches, converters;
+                      generators=generators, baseMVA=baseMVA, loss_model=loss_model)
 end
 
 """
-    HybridSystem(hps::HybridPowerSystem)
+    SolverData(hps::HybridPowerSystem; loss_model=LINEAR_LOSS)
 
-Construct a solver-ready HybridSystem from a JuliaPowerCase HybridPowerSystem.
-Equivalent to `to_solver_system(hps)`.
+Construct a solver-ready SolverData from a JuliaPowerCase HybridPowerSystem.
+Equivalent to `to_solver_data(hps)`.
 """
-HybridSystem(hps::HybridPowerSystem) = to_solver_system(hps)
+SolverData(hps::HybridPowerSystem; loss_model::LossModelType=LINEAR_LOSS) = 
+    to_solver_data(hps; loss_model=loss_model)
 
 # ═══════════════════════════════════════════════════════════════════════════════
 #  ADMITTANCE AND CONDUCTANCE MATRICES (SPARSE)
 # ═══════════════════════════════════════════════════════════════════════════════
 
-function build_admittance_matrix(sys::HybridSystem)
+function build_admittance_matrix(sys::SolverData)
     n = length(sys.ac_buses)
     # Pre-count nonzeros for efficient sparse construction
     nnz_est = n + 2 * count(br -> br.in_service, sys.ac_branches)
@@ -249,7 +284,7 @@ function build_admittance_matrix(sys::HybridSystem)
     return sparse(I, J, V, n, n)
 end
 
-function build_dc_conductance(sys::HybridSystem)
+function build_dc_conductance(sys::SolverData)
     n = length(sys.dc_buses)
     n == 0 && return spzeros(Float64, 0, 0)
     
@@ -299,7 +334,7 @@ mutable struct SolverWorkspace
     nq::Int                    # Q equations (PQ only)
     ndc_eq::Int                # DC equations (non-slack DC)
     
-    # Bus index sets (computed once)
+    # AC bus index sets (computed once)
     pq_idx::Vector{Int}
     pv_idx::Vector{Int}
     slack_idx::Vector{Int}
@@ -307,11 +342,21 @@ mutable struct SolverWorkspace
     vac_control_buses::Vector{Int}
     ac_isolated::Set{Int}
     
-    # Index mappings for Jacobian
+    # DC bus index sets
+    dc_slack_idx::Int          # DC reference bus (0 if no DC or no ref)
+    dc_p_idx::Vector{Int}      # DC P-type buses (power specified)
+    dc_non_slack::Vector{Int}  # DC buses with equations (all except ref)
+    dc_isolated::Set{Int}      # Isolated DC buses
+    
+    # AC index mappings for Jacobian
     bus_to_p_row::Vector{Int}  # bus → P equation row (0 if slack)
     bus_to_q_row::Vector{Int}  # bus → Q equation row (0 if not PQ)
     bus_to_va_col::Vector{Int} # bus → Va column (0 if slack/isolated)
     bus_to_vm_col::Vector{Int} # bus → Vm column (0 if not PQ)
+    
+    # DC index mappings for Jacobian
+    dc_bus_to_pdc_row::Vector{Int}  # DC bus → Pdc equation row (0 if ref)
+    dc_bus_to_vdc_col::Vector{Int}  # DC bus → Vdc column (0 if ref)
     
     # State vectors (reused)
     Vm::Vector{Float64}
@@ -361,18 +406,22 @@ mutable struct SolverWorkspace
     
     # COO to CSC nzval index mapping (for in-place Jacobian updates)
     coo_to_csc::Vector{Int}
+    
+    # Sin/cos cache for AC bus angles (avoids repeated trig calls in Jacobian)
+    sin_Va::Vector{Float64}    # sin(Va[i]) for each AC bus
+    cos_Va::Vector{Float64}    # cos(Va[i]) for each AC bus
 end
 
 """
-    create_solver_workspace(sys::HybridSystem) -> SolverWorkspace
+    create_solver_workspace(sys::SolverData) -> SolverWorkspace
 
 Create pre-allocated workspace for Newton-Raphson solver.
 """
-function create_solver_workspace(sys::HybridSystem)
+function create_solver_workspace(sys::SolverData)
     nac = length(sys.ac_buses)
     ndc = length(sys.dc_buses)
     
-    # Identify bus types
+    # Identify AC bus types
     pq_idx = Int[]
     pv_idx = Int[]
     slack_idx = Int[]
@@ -384,6 +433,24 @@ function create_solver_workspace(sys::HybridSystem)
         else
             push!(slack_idx, i)
         end
+    end
+    
+    # Identify DC bus types (DC_V = REF_BUS, DC_P = PQ_BUS)
+    dc_slack_idx = 0  # DC reference bus (voltage controlled)
+    dc_p_idx = Int[]  # DC P-type buses (power specified)
+    for (i, b) in enumerate(sys.dc_buses)
+        if b.bus_type == DC_V  # REF_BUS
+            if dc_slack_idx == 0
+                dc_slack_idx = i
+            end
+            # Additional DC_V buses treated as P-type (only one reference allowed)
+        else  # DC_P (PQ_BUS) or other
+            push!(dc_p_idx, i)
+        end
+    end
+    # If no explicit DC reference and we have DC buses, use bus 1 as default
+    if dc_slack_idx == 0 && ndc > 0
+        dc_slack_idx = 1
     end
     
     # VDC_VAC converters (treat as PV-like)
@@ -399,10 +466,24 @@ function create_solver_workspace(sys::HybridSystem)
     
     # Detect AC-isolated buses
     ac_isolated = Set{Int}()
-    for i in 1:nac
-        has_branch = any(br.in_service && (br.from_bus == i || br.to_bus == i) for br in sys.ac_branches)
-        if !has_branch
-            push!(ac_isolated, i)
+    if nac > 0
+        for i in 1:nac
+            has_branch = any(br.in_service && (br.from_bus == i || br.to_bus == i) for br in sys.ac_branches)
+            if !has_branch
+                push!(ac_isolated, i)
+            end
+        end
+    end
+    
+    # Detect DC-isolated buses
+    dc_isolated = Set{Int}()
+    if ndc > 0
+        for i in 1:ndc
+            has_branch = any(br.in_service && (br.from_bus == i || br.to_bus == i) for br in sys.dc_branches)
+            has_conv = any(c.in_service && c.bus_dc == i for c in sys.converters)
+            if !has_branch && !has_conv
+                push!(dc_isolated, i)
+            end
         end
     end
     
@@ -410,16 +491,25 @@ function create_solver_workspace(sys::HybridSystem)
     pv_idx_final = sort(setdiff(pv_idx_modified, ac_isolated))
     non_slack = sort(union(pq_idx_final, pv_idx_final))
     
+    # DC non-slack buses (all except reference and isolated)
+    dc_non_slack = Int[]
+    for i in 1:ndc
+        if i != dc_slack_idx && i ∉ dc_isolated
+            push!(dc_non_slack, i)
+        end
+    end
+    sort!(dc_non_slack)
+    
     np = length(non_slack)
     nq = length(pq_idx_final)
-    ndc_eq = max(0, ndc - 1)
+    ndc_eq = length(dc_non_slack)
     nf = np + nq + ndc_eq
     
-    # Build index mappings
-    bus_to_p_row = zeros(Int, nac)
-    bus_to_q_row = zeros(Int, nac)
-    bus_to_va_col = zeros(Int, nac)
-    bus_to_vm_col = zeros(Int, nac)
+    # Build AC index mappings
+    bus_to_p_row = zeros(Int, max(nac, 1))
+    bus_to_q_row = zeros(Int, max(nac, 1))
+    bus_to_va_col = zeros(Int, max(nac, 1))
+    bus_to_vm_col = zeros(Int, max(nac, 1))
     
     for (k, i) in enumerate(non_slack)
         bus_to_p_row[i] = k
@@ -430,6 +520,14 @@ function create_solver_workspace(sys::HybridSystem)
         bus_to_vm_col[i] = np + k
     end
     
+    # Build DC index mappings
+    dc_bus_to_pdc_row = zeros(Int, max(ndc, 1))
+    dc_bus_to_vdc_col = zeros(Int, max(ndc, 1))
+    for (k, i) in enumerate(dc_non_slack)
+        dc_bus_to_pdc_row[i] = np + nq + k
+        dc_bus_to_vdc_col[i] = np + nq + k
+    end
+    
     # Pre-allocate state vectors
     Vm = ones(nac)
     Va = zeros(nac)
@@ -437,6 +535,10 @@ function create_solver_workspace(sys::HybridSystem)
     Vm_old = similar(Vm)
     Va_old = similar(Va)
     Vdc_old = similar(Vdc)
+    
+    # Sin/cos cache for angle differences (populated during Jacobian build)
+    sin_Va = zeros(nac)
+    cos_Va = zeros(nac)
     
     # Power buffers
     Pcalc = zeros(nac)
@@ -455,9 +557,10 @@ function create_solver_workspace(sys::HybridSystem)
     F = zeros(nf)
     dx = zeros(nf)
     
-    # Build Jacobian sparsity pattern
+    # Build Jacobian sparsity pattern (passing DC bus type info)
     J_I, J_J, J_V, J_nnz = build_jacobian_sparsity(sys, non_slack, pq_idx_final, 
-                                                    slack_idx, ac_isolated, nac, ndc, np, nq, ndc_eq)
+                                                    slack_idx, ac_isolated, nac, ndc, np, nq, ndc_eq,
+                                                    dc_slack_idx, dc_non_slack, dc_isolated)
     J_sparse = sparse(J_I, J_J, J_V, nf, nf)
     
     # Extract G and B from Ybus
@@ -495,7 +598,9 @@ function create_solver_workspace(sys::HybridSystem)
     return SolverWorkspace(
         nac, ndc, nf, np, nq, ndc_eq,
         pq_idx_final, pv_idx_final, slack_idx, non_slack, vac_control_buses, ac_isolated,
+        dc_slack_idx, dc_p_idx, dc_non_slack, dc_isolated,
         bus_to_p_row, bus_to_q_row, bus_to_va_col, bus_to_vm_col,
+        dc_bus_to_pdc_row, dc_bus_to_vdc_col,
         Vm, Va, Vdc, Vm_old, Va_old, Vdc_old,
         Pcalc, Qcalc, Psch, Qsch, V_complex, I_complex, S_complex,
         Pdc_calc, Pdc_sch,
@@ -505,7 +610,8 @@ function create_solver_workspace(sys::HybridSystem)
         G_sparse, B_sparse,
         entry_map,
         Ybus_rows, Ybus_cols,
-        coo_to_csc
+        coo_to_csc,
+        sin_Va, cos_Va
     )
 end
 
@@ -514,9 +620,18 @@ Build the sparsity pattern for the Jacobian. Returns (I, J, V, nnz).
 The pattern is determined by Ybus sparsity plus DC coupling.
 """
 function build_jacobian_sparsity(sys, non_slack, pq_idx, slack_idx, ac_isolated, 
-                                  nac, ndc, np, nq, ndc_eq)
+                                  nac, ndc, np, nq, ndc_eq,
+                                  dc_slack_idx=1, dc_non_slack=Int[], dc_isolated=Set{Int}())
     Y = sys.Ybus
     nf = np + nq + ndc_eq
+    
+    # Handle pure DC case (no AC)
+    if nac == 0 || Y === nothing
+        # For pure DC, only DC Jacobian
+        if ndc_eq == 0
+            return Int[], Int[], Float64[], 0
+        end
+    end
     
     # Count nonzeros: each Y[i,j] ≠ 0 contributes to J
     # For each (i,j) with Y[i,j] ≠ 0:
@@ -530,61 +645,78 @@ function build_jacobian_sparsity(sys, non_slack, pq_idx, slack_idx, ac_isolated,
     slack_set = Set(slack_idx)
     
     # Estimate nnz (upper bound)
-    nnz_est = 4 * nnz(Y) + ndc_eq * ndc_eq + 10 * length(sys.converters)
+    Y_nnz = Y === nothing ? 0 : nnz(Y)
+    Gdc_nnz = ndc > 0 && sys.Gdc !== nothing ? nnz(sys.Gdc) : 0
+    nnz_est = 4 * Y_nnz + 4 * Gdc_nnz + 10 * length(sys.converters) + 1
     
     I = Vector{Int}(undef, nnz_est)
     J = Vector{Int}(undef, nnz_est)
     V = Vector{Float64}(undef, nnz_est)
     idx = 0
     
-    # Build column maps
+    # Build column maps for AC
     col_va = Dict(non_slack[k] => k for k in 1:np)
     col_vm = Dict(pq_idx[k] => np + k for k in 1:nq)
     
+    # Build column maps for DC
+    dc_non_slack_set = Set(dc_non_slack)
+    col_vdc = Dict{Int, Int}()
+    for (k, dc_bus) in enumerate(dc_non_slack)
+        col_vdc[dc_bus] = np + nq + k
+    end
+    
     # AC Jacobian blocks (H, N, J, L)
-    rows_Y, cols_Y, _ = findnz(Y)
-    for k in 1:length(rows_Y)
-        i, j = rows_Y[k], cols_Y[k]
-        
-        # P equation row for bus i
-        if i ∉ slack_set && i ∉ ac_isolated && haskey(col_va, i)
-            row_p = col_va[i]
+    if Y !== nothing && nac > 0
+        rows_Y, cols_Y, _ = findnz(Y)
+        for k in 1:length(rows_Y)
+            i, j = rows_Y[k], cols_Y[k]
             
-            # ∂P_i/∂θ_j (H block)
-            if haskey(col_va, j)
-                idx += 1; I[idx] = row_p; J[idx] = col_va[j]; V[idx] = 0.0
+            # P equation row for bus i
+            if i ∉ slack_set && i ∉ ac_isolated && haskey(col_va, i)
+                row_p = col_va[i]
+                
+                # ∂P_i/∂θ_j (H block)
+                if haskey(col_va, j)
+                    idx += 1; I[idx] = row_p; J[idx] = col_va[j]; V[idx] = 0.0
+                end
+                # ∂P_i/∂V_j (N block)
+                if haskey(col_vm, j)
+                    idx += 1; I[idx] = row_p; J[idx] = col_vm[j]; V[idx] = 0.0
+                end
             end
-            # ∂P_i/∂V_j (N block)
-            if haskey(col_vm, j)
-                idx += 1; I[idx] = row_p; J[idx] = col_vm[j]; V[idx] = 0.0
-            end
-        end
-        
-        # Q equation row for bus i (only if i ∈ PQ)
-        if i ∈ pq_set && haskey(col_vm, i)
-            row_q = col_vm[i]  # Q row = np + pq_position
             
-            # ∂Q_i/∂θ_j (J block)
-            if haskey(col_va, j)
-                idx += 1; I[idx] = row_q; J[idx] = col_va[j]; V[idx] = 0.0
-            end
-            # ∂Q_i/∂V_j (L block)
-            if haskey(col_vm, j)
-                idx += 1; I[idx] = row_q; J[idx] = col_vm[j]; V[idx] = 0.0
+            # Q equation row for bus i (only if i ∈ PQ)
+            if i ∈ pq_set && haskey(col_vm, i)
+                row_q = col_vm[i]  # Q row = np + pq_position
+                
+                # ∂Q_i/∂θ_j (J block)
+                if haskey(col_va, j)
+                    idx += 1; I[idx] = row_q; J[idx] = col_va[j]; V[idx] = 0.0
+                end
+                # ∂Q_i/∂V_j (L block)
+                if haskey(col_vm, j)
+                    idx += 1; I[idx] = row_q; J[idx] = col_vm[j]; V[idx] = 0.0
+                end
             end
         end
     end
     
-    # DC Jacobian block
-    if ndc > 1
+    # DC Jacobian block (using actual DC bus types)
+    if ndc_eq > 0 && sys.Gdc !== nothing
         Gdc = sys.Gdc
         rows_G, cols_G, _ = findnz(Gdc)
         for k in 1:length(rows_G)
             ki, li = rows_G[k], cols_G[k]
-            ki == 1 && continue  # DC slack
-            li == 1 && continue  # DC slack column
-            row = np + nq + ki - 1
-            col = np + nq + li - 1
+            # Skip DC slack bus (reference) and isolated DC buses
+            ki == dc_slack_idx && continue
+            li == dc_slack_idx && continue
+            ki ∈ dc_isolated && continue
+            li ∈ dc_isolated && continue
+            
+            haskey(col_vdc, ki) || continue
+            haskey(col_vdc, li) || continue
+            row = col_vdc[ki]
+            col = col_vdc[li]
             idx += 1; I[idx] = row; J[idx] = col; V[idx] = 0.0
         end
         
@@ -593,11 +725,12 @@ function build_jacobian_sparsity(sys, non_slack, pq_idx, slack_idx, ac_isolated,
             conv.in_service || continue
             (conv.control_mode == VDC_Q || conv.control_mode == VDC_VAC) || continue
             k = conv.bus_dc
-            k == 1 && continue
-            ki = k - 1
-            row = np + nq + ki
-            col = np + nq + ki
-            # Check if this entry already exists; if not, add it
+            k == dc_slack_idx && continue
+            k ∈ dc_isolated && continue
+            haskey(col_vdc, k) || continue
+            row = col_vdc[k]
+            col = col_vdc[k]
+            # This entry may already exist from Gdc, but adding duplicate is okay
             idx += 1; I[idx] = row; J[idx] = col; V[idx] = 0.0
         end
         
@@ -606,12 +739,13 @@ function build_jacobian_sparsity(sys, non_slack, pq_idx, slack_idx, ac_isolated,
             conv.in_service || continue
             (conv.control_mode == VDC_Q || conv.control_mode == VDC_VAC) || continue
             k = conv.bus_dc
-            k == 1 && continue
+            k == dc_slack_idx && continue
+            k ∈ dc_isolated && continue
             haskey(col_va, conv.bus_ac) || continue
-            ki = k - 1
+            haskey(col_vdc, k) || continue
             row_p = col_va[conv.bus_ac]
-            col_vdc = np + nq + ki
-            idx += 1; I[idx] = row_p; J[idx] = col_vdc; V[idx] = 0.0
+            col_dc = col_vdc[k]
+            idx += 1; I[idx] = row_p; J[idx] = col_dc; V[idx] = 0.0
         end
     end
     
@@ -625,13 +759,31 @@ end
 
 """
 Compute AC power injections in-place into workspace buffers.
+Also caches sin(Va) and cos(Va) for use in Jacobian building.
 """
 function compute_power_injections!(ws::SolverWorkspace, Y::SparseMatrixCSC{ComplexF64, Int})
-    @inbounds for i in 1:ws.nac
-        ws.V_complex[i] = ws.Vm[i] * cis(ws.Va[i])
+    nac = ws.nac
+    Vm = ws.Vm
+    Va = ws.Va
+    sin_Va = ws.sin_Va
+    cos_Va = ws.cos_Va
+    
+    # Cache sin/cos values with @turbo for SIMD acceleration
+    @turbo for i in 1:nac
+        sin_Va[i] = sin(Va[i])
+        cos_Va[i] = cos(Va[i])
     end
+    
+    # Build complex voltage vector (requires sequential due to complex ops)
+    @inbounds for i in 1:nac
+        ws.V_complex[i] = complex(Vm[i] * cos_Va[i], Vm[i] * sin_Va[i])
+    end
+    
+    # Sparse matrix-vector product (uses BLAS)
     mul!(ws.I_complex, Y, ws.V_complex)
-    @inbounds for i in 1:ws.nac
+    
+    # Compute power injections
+    @inbounds for i in 1:nac
         ws.S_complex[i] = ws.V_complex[i] * conj(ws.I_complex[i])
         ws.Pcalc[i] = real(ws.S_complex[i])
         ws.Qcalc[i] = imag(ws.S_complex[i])
@@ -684,14 +836,15 @@ Compute Jacobian entries for converter loss: ∂Ploss/∂P and ∂Ploss/∂Vdc.
 - `CURRENT_BASED_LOSS`: 
   - dPloss/dP = (2a·|P|/Vdc² + b/Vdc)·sign(P)
   - dPloss/dVdc = -2a·P²/Vdc³ - b·|P|/Vdc²
+
+Returns an `SVector{2}` for stack allocation: [dPloss_dP, dPloss_dVdc].
 """
 @inline function converter_loss_jacobian(conv::VSCConverter, P::Float64, Vdc_val::Float64,
                                          baseMVA::Float64, loss_model::LossModelType)
     if loss_model == LINEAR_LOSS
         # dPloss/dP = (1-η)·sign(P)
         dPloss_dP = (1.0 - conv.eta) * sign(P + 1e-30)
-        dPloss_dVdc = 0.0
-        return (dPloss_dP, dPloss_dVdc)
+        return @SVector [dPloss_dP, 0.0]
     else  # CURRENT_BASED_LOSS
         a = conv.loss_mw / baseMVA
         b = conv.loss_percent / 100.0
@@ -708,8 +861,38 @@ Compute Jacobian entries for converter loss: ∂Ploss/∂P and ∂Ploss/∂Vdc.
         #             = -2a·P²/Vdc³ - b·|P|/Vdc²
         dPloss_dVdc = -2.0 * a * P^2 / Vdc_safe^3 - b * absP / Vdc_safe^2
         
-        return (dPloss_dP, dPloss_dVdc)
+        return @SVector [dPloss_dP, dPloss_dVdc]
     end
+end
+
+"""
+    compute_converter_jacobian_block(conv, Vdc, baseMVA, loss_model) -> SVector{2}
+
+Compute converter Jacobian contributions as static vector for stack allocation.
+Returns [∂Pdc_diag, ∂Pac_∂Vdc] where:
+- ∂Pdc_diag: Contribution to DC diagonal (for VDC modes)
+- ∂Pac_∂Vdc: AC-DC cross-coupling term
+
+This uses StaticArrays for zero-allocation Jacobian block computation.
+"""
+@inline function compute_converter_jacobian_block(conv::VSCConverter, Vdc::Vector{Float64},
+                                                  baseMVA::Float64, loss_model::LossModelType)
+    Vdc_val = Vdc[conv.bus_dc]
+    k_vdc = conv.k_vdc
+    
+    # DC diagonal contribution: 2·k_vdc·Vdc
+    dPdc_diag = 2.0 * k_vdc * Vdc_val
+    
+    # AC-DC coupling through loss model
+    P_transfer = k_vdc * (Vdc_val^2 - conv.v_dc_set_pu^2)
+    loss_jac = converter_loss_jacobian(conv, P_transfer, Vdc_val, baseMVA, loss_model)
+    dPloss_dP = loss_jac[1]
+    dPloss_dVdc = loss_jac[2]
+    
+    # ∂Pac/∂Vdc = ∂Pdc/∂Vdc × (1 - ∂Ploss/∂P) - ∂Ploss/∂Vdc
+    dPac_dVdc = dPdc_diag * (1.0 - dPloss_dP) - dPloss_dVdc
+    
+    return @SVector [dPdc_diag, dPac_dVdc]
 end
 
 # Legacy compatibility: single-argument version defaults to LINEAR_LOSS with Vdc=1.0
@@ -770,9 +953,10 @@ end
     build_jacobian_triplets!(ws, sys)
 
 Update Jacobian values in COO format. Sparsity pattern is fixed;
-only values are updated. Uses @inbounds and cached sin/cos.
+only values are updated. Uses @inbounds and cached sin/cos with
+angle-difference identities for SIMD-friendly computation.
 """
-function build_jacobian_triplets!(ws::SolverWorkspace, sys::HybridSystem)
+function build_jacobian_triplets!(ws::SolverWorkspace, sys::SolverData)
     G = ws.G_sparse
     B = ws.B_sparse
     Vm = ws.Vm
@@ -785,6 +969,10 @@ function build_jacobian_triplets!(ws::SolverWorkspace, sys::HybridSystem)
     np = ws.np
     nq = ws.nq
     ndc_eq = ws.ndc_eq
+    
+    # Cached sin/cos values (computed in compute_power_injections!)
+    sin_Va = ws.sin_Va
+    cos_Va = ws.cos_Va
     
     # Reset Jacobian values
     fill!(ws.J_V, 0.0)
@@ -817,9 +1005,13 @@ function build_jacobian_triplets!(ws::SolverWorkspace, sys::HybridSystem)
         Bij = B[i, j]
         (Gij == 0.0 && Bij == 0.0) && continue
         
-        θij = Va[i] - Va[j]
-        sinθ = sin(θij)
-        cosθ = cos(θij)
+        # Use angle-difference identities with cached sin/cos:
+        # sin(θi - θj) = sin(θi)cos(θj) - cos(θi)sin(θj)
+        # cos(θi - θj) = cos(θi)cos(θj) + sin(θi)sin(θj)
+        sin_i, cos_i = sin_Va[i], cos_Va[i]
+        sin_j, cos_j = sin_Va[j], cos_Va[j]
+        sinθ = sin_i * cos_j - cos_i * sin_j
+        cosθ = cos_i * cos_j + sin_i * sin_j
         
         row_p = bus_to_p_row[i]
         row_q = bus_to_q_row[i]
@@ -881,17 +1073,22 @@ function build_jacobian_triplets!(ws::SolverWorkspace, sys::HybridSystem)
         end
     end
     
-    # DC Jacobian block
-    if ndc > 1
+    # DC Jacobian block (using actual DC bus types from workspace)
+    dc_non_slack = ws.dc_non_slack
+    dc_isolated = ws.dc_isolated
+    dc_slack_idx = ws.dc_slack_idx
+    dc_bus_to_vdc_col = ws.dc_bus_to_vdc_col
+    
+    if ndc_eq > 0 && sys.Gdc !== nothing
         Gdc = sys.Gdc
-        for ki in 1:(ndc-1)
-            k = ki + 1  # DC bus index (skip DC slack = bus 1)
-            for li in 1:(ndc-1)
-                l = li + 1
+        # Iterate over DC non-slack buses
+        for (ki, k) in enumerate(dc_non_slack)
+            for (li, l) in enumerate(dc_non_slack)
                 row = np + nq + ki
                 col = np + nq + li
                 
                 if k == l
+                    # Diagonal: ∂Pdc_k/∂Vdc_k = 2·G_kk·Vdc_k + Σ_{m≠k} G_km·Vdc_m
                     dPk = 2.0 * Gdc[k,k] * Vdc[k]
                     for m in 1:ndc
                         m == k && continue
@@ -900,53 +1097,42 @@ function build_jacobian_triplets!(ws::SolverWorkspace, sys::HybridSystem)
                     key = (row, col)
                     haskey(entry_map, key) && (J_V[entry_map[key]] = dPk)
                 else
+                    # Off-diagonal: ∂Pdc_k/∂Vdc_l = G_kl·Vdc_k
                     key = (row, col)
                     haskey(entry_map, key) && (J_V[entry_map[key]] = Gdc[k,l] * Vdc[k])
                 end
             end
         end
         
-        # Converter DC contributions
-        for conv in sys.converters
-            conv.in_service || continue
-            (conv.control_mode == VDC_Q || conv.control_mode == VDC_VAC) || continue
-            k = conv.bus_dc
-            k == 1 && continue
-            ki = k - 1
-            row = np + nq + ki
-            col = np + nq + ki
-            key = (row, col)
-            if haskey(entry_map, key)
-                J_V[entry_map[key]] += 2.0 * conv.k_vdc * Vdc[k]
-            end
-        end
-        
-        # AC–DC cross-coupling (uses loss model Jacobian)
+        # Converter Jacobian contributions using static arrays (droop modes)
         loss_model = sys.loss_model
         for conv in sys.converters
             conv.in_service || continue
             (conv.control_mode == VDC_Q || conv.control_mode == VDC_VAC) || continue
             k = conv.bus_dc
-            k == 1 && continue
-            row_p = bus_to_p_row[conv.bus_ac]
-            row_p == 0 && continue
-            ki = k - 1
-            col_vdc = np + nq + ki
+            k == dc_slack_idx && continue
+            k ∈ dc_isolated && continue
+            col_idx = dc_bus_to_vdc_col[k]
+            col_idx == 0 && continue
             
-            Vdc_val = Vdc[k]
-            P_transfer = conv.k_vdc * (Vdc_val^2 - conv.v_dc_set_pu^2)
-            dPloss_dP, dPloss_dVdc = converter_loss_jacobian(conv, P_transfer, Vdc_val, 
-                                                              sys.baseMVA, loss_model)
+            # Compute both DC diagonal and AC-DC coupling with static arrays
+            jac_block = compute_converter_jacobian_block(conv, Vdc, sys.baseMVA, loss_model)
+            dPdc_diag = jac_block[1]   # DC diagonal contribution
+            dPac_dVdc = jac_block[2]   # AC-DC cross-coupling
             
-            # ∂Pac/∂Vdc = ∂(Pdc - Ploss)/∂Vdc
-            #           = ∂Pdc/∂Vdc - ∂Ploss/∂P × ∂P/∂Vdc - ∂Ploss/∂Vdc
-            # where ∂Pdc/∂Vdc = 2·k_vdc·Vdc
-            dPdc_dVdc = 2.0 * conv.k_vdc * Vdc_val
-            dPac_dVdc = dPdc_dVdc * (1.0 - dPloss_dP) - dPloss_dVdc
-            
-            key = (row_p, col_vdc)
+            # Add DC diagonal contribution
+            key = (col_idx, col_idx)
             if haskey(entry_map, key)
-                J_V[entry_map[key]] -= dPac_dVdc
+                J_V[entry_map[key]] += dPdc_diag
+            end
+            
+            # Add AC-DC cross-coupling (subtract because injected power convention)
+            row_p = bus_to_p_row[conv.bus_ac]
+            if row_p > 0
+                key = (row_p, col_idx)
+                if haskey(entry_map, key)
+                    J_V[entry_map[key]] -= dPac_dVdc
+                end
             end
         end
     end
@@ -964,7 +1150,9 @@ end
 # ═══════════════════════════════════════════════════════════════════════════════
 
 """
-    solve_power_flow(sys; max_iter=50, tol=1e-8)
+    solve_power_flow(sys::SolverData; max_iter=50, tol=1e-8, init=nothing)
+
+Internal method - users should call `solve_power_flow(hps::HybridPowerSystem)` instead.
 
 Solve hybrid AC/DC power flow using Newton-Raphson with:
 - Sparse Jacobian and sparse LU factorization
@@ -976,7 +1164,7 @@ Keyword arguments:
 - `tol`: Infinity-norm convergence tolerance on mismatch vector
 - `init`: Optional warm-start state as `(Vm=..., Va=..., Vdc=...)`
 """
-function solve_power_flow(sys::HybridSystem; max_iter::Int=50, tol::Float64=1e-8,
+function solve_power_flow(sys::SolverData; max_iter::Int=50, tol::Float64=1e-8,
                           init::Union{Nothing,NamedTuple}=nothing)
     rebuild_matrices!(sys)
     ws = create_solver_workspace(sys)
@@ -1049,8 +1237,8 @@ function solve_power_flow(sys::HybridSystem; max_iter::Int=50, tol::Float64=1e-8
             ws.F[np + k] = ws.Qcalc[i] - ws.Qsch[i]
         end
         
-        # DC residual
-        if ndc > 1
+        # DC residual (using actual DC bus types)
+        if ndc_eq > 0 && ndc > 0 && sys.Gdc !== nothing
             mul!(ws.Pdc_calc, sys.Gdc, ws.Vdc)
             @inbounds for i in 1:ndc
                 ws.Pdc_calc[i] *= ws.Vdc[i]
@@ -1062,8 +1250,8 @@ function solve_power_flow(sys::HybridSystem; max_iter::Int=50, tol::Float64=1e-8
                 conv.in_service || continue
                 ws.Pdc_sch[conv.bus_dc] += converter_dc_injection(conv, ws.Vm, ws.Va, ws.Vdc, baseMVA, sys.loss_model)
             end
-            @inbounds for k in 1:(ndc-1)
-                ws.F[np + nq + k] = ws.Pdc_calc[k+1] - ws.Pdc_sch[k+1]
+            @inbounds for (k, dc_bus) in enumerate(ws.dc_non_slack)
+                ws.F[np + nq + k] = ws.Pdc_calc[dc_bus] - ws.Pdc_sch[dc_bus]
             end
         end
         
@@ -1117,9 +1305,9 @@ function solve_power_flow(sys::HybridSystem; max_iter::Int=50, tol::Float64=1e-8
             @inbounds for (k, i) in enumerate(ws.pq_idx)
                 ws.Vm[i] = ws.Vm_old[i] + α * ws.dx[np + k]
             end
-            if ndc > 1
-                @inbounds for k in 1:(ndc-1)
-                    ws.Vdc[k+1] = ws.Vdc_old[k+1] + α * ws.dx[np + nq + k]
+            if ndc_eq > 0
+                @inbounds for (k, dc_bus) in enumerate(ws.dc_non_slack)
+                    ws.Vdc[dc_bus] = ws.Vdc_old[dc_bus] + α * ws.dx[np + nq + k]
                 end
             end
             
@@ -1150,7 +1338,7 @@ function solve_power_flow(sys::HybridSystem; max_iter::Int=50, tol::Float64=1e-8
             @inbounds for (k, i) in enumerate(ws.pq_idx)
                 new_res = max(new_res, abs(ws.Qcalc[i] - ws.Qsch[i]))
             end
-            if ndc > 1
+            if ndc_eq > 0 && sys.Gdc !== nothing
                 mul!(ws.Pdc_calc, sys.Gdc, ws.Vdc)
                 @inbounds for i in 1:ndc
                     ws.Pdc_calc[i] *= ws.Vdc[i]
@@ -1162,8 +1350,8 @@ function solve_power_flow(sys::HybridSystem; max_iter::Int=50, tol::Float64=1e-8
                     conv.in_service || continue
                     ws.Pdc_sch[conv.bus_dc] += converter_dc_injection(conv, ws.Vm, ws.Va, ws.Vdc, baseMVA, sys.loss_model)
                 end
-                @inbounds for k in 1:(ndc-1)
-                    new_res = max(new_res, abs(ws.Pdc_calc[k+1] - ws.Pdc_sch[k+1]))
+                @inbounds for (k, dc_bus) in enumerate(ws.dc_non_slack)
+                    new_res = max(new_res, abs(ws.Pdc_calc[dc_bus] - ws.Pdc_sch[dc_bus]))
                 end
             end
             
@@ -1184,9 +1372,9 @@ function solve_power_flow(sys::HybridSystem; max_iter::Int=50, tol::Float64=1e-8
             @inbounds for (k, i) in enumerate(ws.pq_idx)
                 ws.Vm[i] = ws.Vm_old[i] + α * ws.dx[np + k]
             end
-            if ndc > 1
-                @inbounds for k in 1:(ndc-1)
-                    ws.Vdc[k+1] = ws.Vdc_old[k+1] + α * ws.dx[np + nq + k]
+            if ndc_eq > 0
+                @inbounds for (k, dc_bus) in enumerate(ws.dc_non_slack)
+                    ws.Vdc[dc_bus] = ws.Vdc_old[dc_bus] + α * ws.dx[np + nq + k]
                 end
             end
             @inbounds for i in 1:nac
@@ -1225,12 +1413,10 @@ end
 """
     solve_power_flow(hps::HybridPowerSystem; kwargs...)
 
-Solve power flow for a JuliaPowerCase `HybridPowerSystem`.
+Solve hybrid AC/DC power flow using Newton-Raphson method.
 
-This is a convenience method that:
-1. Converts the HybridPowerSystem to a solver-ready HybridSystem
-2. Runs the Newton-Raphson solver
-3. Returns the solution
+This is the main user-facing API. Accepts a `HybridPowerSystem` from JuliaPowerCase,
+internally creates solver workspace, solves, and writes results back to the input.
 
 # Example
 ```julia
@@ -1239,11 +1425,276 @@ hps = case_hybrid_5ac3dc()  # Load a test case
 result = solve_power_flow(hps)
 ```
 
-See `solve_power_flow(::HybridSystem)` for full documentation.
+See `solve_power_flow(::SolverData)` for implementation details.
 """
 function solve_power_flow(hps::HybridPowerSystem; kwargs...)
-    sys = to_solver_system(hps)
+    sys = to_solver_data(hps)
     return solve_power_flow(sys; kwargs...)
+end
+
+# ═══════════════════════════════════════════════════════════════════════════════
+#  PURE DC POWER FLOW SOLVER  
+# ═══════════════════════════════════════════════════════════════════════════════
+
+"""
+    solve_dc_power_flow(sys; max_iter=50, tol=1e-8, init=nothing)
+
+Solve pure DC power flow using Newton-Raphson. This is a specialized solver
+for systems with only DC buses and branches (no AC components).
+
+# DC Bus Types
+- `DC_V` (3): Voltage reference bus - voltage is fixed, power is solved
+- `DC_P` (1): Power-specified bus - power is specified, voltage is solved
+
+# Mathematical Formulation
+The DC power flow equations are:
+    Pdc_k = Vdc_k × Σⱼ G_kj × Vdc_j  for all buses k
+
+For each DC_P bus, we solve for Vdc such that:
+    Pdc_calc_k - Pdc_sch_k = 0
+
+The DC_V bus serves as the voltage reference (like a slack bus in AC).
+
+# Arguments
+- `sys::SolverData`: System with DC buses and DC lines (AC should be empty)
+- `max_iter::Int=50`: Maximum Newton-Raphson iterations  
+- `tol::Float64=1e-8`: Convergence tolerance (infinity norm)
+- `init::NamedTuple=nothing`: Optional initial guess as `(Vdc=...,)`
+
+# Returns
+Named tuple with:
+- `Vdc::Vector{Float64}`: DC bus voltages (p.u.)
+- `converged::Bool`: Whether solution converged
+- `iterations::Int`: Number of iterations taken
+- `residual::Float64`: Final mismatch magnitude
+
+# Example
+```julia
+# Build a DC-only system using JuliaPowerCase
+using JuliaPowerCase, HybridACDCPowerFlow
+dc_sys = DCPowerSystem()
+# Add DC buses and solve
+result = solve_dc_power_flow(to_solver_data(dc_sys))
+```
+"""
+function solve_dc_power_flow(sys::SolverData; max_iter::Int=50, tol::Float64=1e-8,
+                              init::Union{Nothing,NamedTuple}=nothing)
+    ndc = length(sys.dc_buses)
+    ndc == 0 && error("No DC buses in the system")
+    
+    # Ensure DC admittance matrix is built
+    if sys.Gdc === nothing
+        rebuild_matrices!(sys)
+    end
+    sys.Gdc === nothing && error("Failed to build DC conductance matrix")
+    
+    Gdc = sys.Gdc
+    baseMVA = sys.baseMVA
+    
+    # Identify DC bus types
+    dc_slack_idx = 0
+    dc_p_idx = Int[]
+    
+    for (i, bus) in enumerate(sys.dc_buses)
+        bt = bus.bus_type
+        if bt == DC_V || bt == REF_BUS
+            if dc_slack_idx == 0
+                dc_slack_idx = i
+            end
+        else
+            push!(dc_p_idx, i)
+        end
+    end
+    
+    # Default: if no DC_V bus specified, use bus 1 as reference
+    if dc_slack_idx == 0
+        dc_slack_idx = 1
+        dc_p_idx = collect(2:ndc)
+    end
+    
+    ndc_eq = length(dc_p_idx)  # Number of DC equations (non-slack buses)
+    
+    if ndc_eq == 0
+        # Only one bus or all are references - trivial case
+        Vdc = [bus.vm_pu for bus in sys.dc_buses]
+        return (Vdc=Vdc, converged=true, iterations=0, residual=0.0)
+    end
+    
+    # Initialize DC voltages
+    Vdc = zeros(ndc)
+    if init === nothing
+        @inbounds for i in 1:ndc
+            Vdc[i] = sys.dc_buses[i].vm_pu
+        end
+    else
+        hasproperty(init, :Vdc) || error("init must contain field Vdc")
+        copyto!(Vdc, init.Vdc)
+    end
+    
+    # Allocate workspace
+    F = zeros(ndc_eq)                    # Mismatch vector
+    Pdc_calc = zeros(ndc)                # Calculated DC power
+    Pdc_sch = zeros(ndc)                 # Scheduled DC power
+    dx = zeros(ndc_eq)                   # Newton step
+    Vdc_old = zeros(ndc)                 # For line search
+    
+    # Build DC Jacobian sparsity pattern
+    # For DC power flow: ∂Pdc_k/∂Vdc_l
+    # Row k-th equation (for k in dc_p_idx) -> row index in Jacobian
+    # Col l-th variable (for l in dc_p_idx) -> col index in Jacobian
+    
+    dc_bus_to_row = zeros(Int, ndc)
+    dc_bus_to_col = zeros(Int, ndc)
+    for (k, dc_bus) in enumerate(dc_p_idx)
+        dc_bus_to_row[dc_bus] = k
+        dc_bus_to_col[dc_bus] = k
+    end
+    
+    # Build Jacobian structure
+    rows_G, cols_G, _ = findnz(Gdc)
+    I_jac = Int[]
+    J_jac = Int[]
+    for k in 1:length(rows_G)
+        i, j = rows_G[k], cols_G[k]
+        i == dc_slack_idx && continue
+        j == dc_slack_idx && continue
+        row = dc_bus_to_row[i]
+        col = dc_bus_to_col[j]
+        row == 0 && continue
+        col == 0 && continue
+        push!(I_jac, row)
+        push!(J_jac, col)
+    end
+    
+    V_jac = zeros(length(I_jac))
+    J = sparse(I_jac, J_jac, V_jac, ndc_eq, ndc_eq)
+    
+    # Build entry map for Jacobian updates
+    entry_map = Dict{Tuple{Int,Int}, Int}()
+    for k in 1:length(I_jac)
+        entry_map[(I_jac[k], J_jac[k])] = k
+    end
+    
+    lu_factor = nothing
+    
+    for iter in 1:max_iter
+        # Compute DC power injections: Pdc_k = Vdc_k × Σⱼ G_kj × Vdc_j
+        mul!(Pdc_calc, Gdc, Vdc)
+        @inbounds for i in 1:ndc
+            Pdc_calc[i] *= Vdc[i]
+        end
+        
+        # Scheduled power (load - generation)
+        @inbounds for i in 1:ndc
+            # Positive Pd means consumption, so scheduled injection = -Pd
+            Pdc_sch[i] = -sys.dc_buses[i].pd_mw / baseMVA
+        end
+        
+        # Build mismatch vector
+        @inbounds for (k, dc_bus) in enumerate(dc_p_idx)
+            F[k] = Pdc_calc[dc_bus] - Pdc_sch[dc_bus]
+        end
+        
+        res_norm = norm(F, Inf)
+        if res_norm < tol
+            return (Vdc=copy(Vdc), converged=true, iterations=iter, residual=res_norm)
+        end
+        
+        # Build Jacobian
+        fill!(V_jac, 0.0)
+        for (k_eq, k) in enumerate(dc_p_idx)
+            for (l_eq, l) in enumerate(dc_p_idx)
+                key = (k_eq, l_eq)
+                haskey(entry_map, key) || continue
+                
+                if k == l
+                    # Diagonal: ∂Pdc_k/∂Vdc_k = 2·G_kk·Vdc_k + Σ_{m≠k} G_km·Vdc_m
+                    dPk = 2.0 * Gdc[k,k] * Vdc[k]
+                    for m in 1:ndc
+                        m == k && continue
+                        dPk += Gdc[k,m] * Vdc[m]
+                    end
+                    V_jac[entry_map[key]] = dPk
+                else
+                    # Off-diagonal: ∂Pdc_k/∂Vdc_l = G_kl·Vdc_k
+                    V_jac[entry_map[key]] = Gdc[k,l] * Vdc[k]
+                end
+            end
+        end
+        
+        # Update sparse matrix values
+        for (k, (i, j)) in enumerate(zip(I_jac, J_jac))
+            J[i, j] = V_jac[k]
+        end
+        
+        # Solve linear system
+        try
+            if lu_factor === nothing
+                lu_factor = lu(J)
+            else
+                try
+                    lu!(lu_factor, J)
+                catch
+                    lu_factor = lu(J)
+                end
+            end
+            ldiv!(dx, lu_factor, F)
+            dx .*= -1.0
+        catch e
+            return (Vdc=copy(Vdc), converged=false, iterations=iter, residual=res_norm)
+        end
+        
+        # Check for NaN/Inf
+        if any(!isfinite, dx)
+            return (Vdc=copy(Vdc), converged=false, iterations=iter, residual=res_norm)
+        end
+        
+        # Simple line search
+        copyto!(Vdc_old, Vdc)
+        α = 1.0
+        
+        for _ls in 1:8
+            @inbounds for (k, dc_bus) in enumerate(dc_p_idx)
+                Vdc[dc_bus] = Vdc_old[dc_bus] + α * dx[k]
+            end
+            
+            # Clamp voltages
+            @inbounds for i in 1:ndc
+                Vdc[i] = max(Vdc[i], 0.05)
+            end
+            
+            # Check new residual
+            mul!(Pdc_calc, Gdc, Vdc)
+            @inbounds for i in 1:ndc
+                Pdc_calc[i] *= Vdc[i]
+            end
+            @inbounds for i in 1:ndc
+                Pdc_sch[i] = -sys.dc_buses[i].pd_mw / baseMVA
+            end
+            
+            new_res = 0.0
+            @inbounds for (k, dc_bus) in enumerate(dc_p_idx)
+                new_res = max(new_res, abs(Pdc_calc[dc_bus] - Pdc_sch[dc_bus]))
+            end
+            
+            new_res < res_norm && break
+            α *= 0.5
+        end
+    end
+    
+    # Did not converge
+    return (Vdc=copy(Vdc), converged=false, iterations=max_iter, residual=norm(F, Inf))
+end
+
+"""
+    solve_dc_power_flow(hps::HybridPowerSystem; kwargs...)
+
+Solve pure DC power flow for a JuliaPowerCase `HybridPowerSystem`.
+See `solve_dc_power_flow(::SolverData)` for full documentation.
+"""
+function solve_dc_power_flow(hps::HybridPowerSystem; kwargs...)
+    sys = to_solver_system(hps)
+    return solve_dc_power_flow(sys; kwargs...)
 end
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -1255,7 +1706,7 @@ end
 
 Compute AC power injections (legacy interface, allocates).
 """
-function ac_power_injections(sys::HybridSystem, Vm::Vector{Float64}, Va::Vector{Float64})
+function ac_power_injections(sys::SolverData, Vm::Vector{Float64}, Va::Vector{Float64})
     Y = sys.Ybus === nothing ? build_admittance_matrix(sys) : sys.Ybus
     V = Vm .* cis.(Va)
     I = Y * V
@@ -1268,7 +1719,7 @@ end
 
 Compute full AC/DC power flow mismatch vector (legacy interface).
 """
-function power_flow_residual(sys::HybridSystem, Vm::Vector{Float64}, Va::Vector{Float64},
+function power_flow_residual(sys::SolverData, Vm::Vector{Float64}, Va::Vector{Float64},
                               Vdc::Vector{Float64})
     nac = length(sys.ac_buses)
     ndc = length(sys.dc_buses)
@@ -1328,7 +1779,7 @@ end
 """
 Full residual as a single vector for NR solver (legacy).
 """
-function full_residual(sys::HybridSystem, x::Vector{Float64})
+function full_residual(sys::SolverData, x::Vector{Float64})
     nac = length(sys.ac_buses)
     ndc = length(sys.dc_buses)
 
@@ -1367,11 +1818,22 @@ function full_residual_simple(sys, Vm, Va, Vdc)
     return vcat(F_ac, F_dc)
 end
 
+"""
+    full_residual_simple(hps::HybridPowerSystem, Vm, Va, Vdc)
+
+Convenience wrapper for computing residual from HybridPowerSystem.
+Internally converts to SolverData.
+"""
+function full_residual_simple(hps::HybridPowerSystem, Vm, Va, Vdc)
+    sys = to_solver_data(hps)
+    return full_residual_simple(sys, Vm, Va, Vdc)
+end
+
 # ═══════════════════════════════════════════════════════════════════════════════
 #  TOPOLOGY MODIFICATION
 # ═══════════════════════════════════════════════════════════════════════════════
 
-function remove_ac_branch(sys::HybridSystem, branch_idx::Int)
+function remove_ac_branch(sys::SolverData, branch_idx::Int)
     new_branches = copy(sys.ac_branches)
     br = new_branches[branch_idx]
     # Create a copy with in_service=false
@@ -1388,11 +1850,11 @@ function remove_ac_branch(sys::HybridSystem, branch_idx::Int)
         mtbf_hours=br.mtbf_hours, mttr_hours=br.mttr_hours,
         t_scheduled_h=br.t_scheduled_h, sw_hours=br.sw_hours, rp_hours=br.rp_hours
     )
-    return HybridSystem(sys.ac_buses, new_branches, sys.dc_buses, sys.dc_branches,
+    return SolverData(sys.ac_buses, new_branches, sys.dc_buses, sys.dc_branches,
                         sys.converters; generators=sys.generators, baseMVA=sys.baseMVA)
 end
 
-function remove_dc_branch(sys::HybridSystem, branch_idx::Int)
+function remove_dc_branch(sys::SolverData, branch_idx::Int)
     new_branches = copy(sys.dc_branches)
     br = new_branches[branch_idx]
     new_branches[branch_idx] = Branch{DC}(
@@ -1408,11 +1870,11 @@ function remove_dc_branch(sys::HybridSystem, branch_idx::Int)
         mtbf_hours=br.mtbf_hours, mttr_hours=br.mttr_hours,
         t_scheduled_h=br.t_scheduled_h, sw_hours=br.sw_hours, rp_hours=br.rp_hours
     )
-    return HybridSystem(sys.ac_buses, sys.ac_branches, sys.dc_buses, new_branches,
+    return SolverData(sys.ac_buses, sys.ac_branches, sys.dc_buses, new_branches,
                         sys.converters; generators=sys.generators, baseMVA=sys.baseMVA)
 end
 
-function remove_converter(sys::HybridSystem, conv_idx::Int)
+function remove_converter(sys::SolverData, conv_idx::Int)
     new_convs = copy(sys.converters)
     c = new_convs[conv_idx]
     new_convs[conv_idx] = VSCConverter(
@@ -1427,7 +1889,7 @@ function remove_converter(sys::HybridSystem, conv_idx::Int)
         k_vdc=c.k_vdc, k_p=c.k_p, k_q=c.k_q, v_ref_pu=c.v_ref_pu, f_ref_hz=c.f_ref_hz,
         mtbf_hours=c.mtbf_hours, mttr_hours=c.mttr_hours, t_scheduled_h=c.t_scheduled_h
     )
-    return HybridSystem(sys.ac_buses, sys.ac_branches, sys.dc_buses, sys.dc_branches,
+    return SolverData(sys.ac_buses, sys.ac_branches, sys.dc_buses, sys.dc_branches,
                         new_convs; generators=sys.generators, baseMVA=sys.baseMVA)
 end
 
@@ -1439,12 +1901,12 @@ function get_bus_voltages(result)
     return result.Vm, result.Va, result.Vdc
 end
 
-function get_branch_flows(sys::HybridSystem, result)
+function get_branch_flows(sys::SolverData, result)
     Vm, Va, _ = get_bus_voltages(result)
     return get_branch_flows(sys, Vm, Va)
 end
 
-function get_branch_flows(sys::HybridSystem, Vm::Vector{Float64}, Va::Vector{Float64})
+function get_branch_flows(sys::SolverData, Vm::Vector{Float64}, Va::Vector{Float64})
     n_br = length(sys.ac_branches)
     Pij = zeros(n_br)
     Qij = zeros(n_br)
@@ -1469,7 +1931,7 @@ end
 #  GRAPH DATA EXTRACTION FOR GNN
 # ═══════════════════════════════════════════════════════════════════════════════
 
-function extract_graph_data(sys::HybridSystem)
+function extract_graph_data(sys::SolverData)
     nac = length(sys.ac_buses)
     ndc = length(sys.dc_buses)
     baseMVA = sys.baseMVA

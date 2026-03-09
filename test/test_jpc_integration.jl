@@ -219,8 +219,8 @@ end
         # Solve via HybridPowerSystem overload
         result_jpc = solve_power_flow(hps)
         
-        # Solve via internal conversion (to_solver_system)
-        sys_internal = to_solver_system(hps)
+        # Solve via internal conversion (to_solver_data)
+        sys_internal = to_solver_data(hps)
         result_internal = solve_power_flow(sys_internal)
         
         println("  JPC converged: $(result_jpc.converged), Internal converged: $(result_internal.converged)")
@@ -240,15 +240,15 @@ end
         println("  ✅ PASS\n")
     end
     
-    @testset "6. to_solver_system Conversion" begin
+    @testset "6. to_solver_data Conversion" begin
         println("="^70)
-        println("【TEST 6】to_solver_system CONVERSION")
+        println("【TEST 6】to_solver_data CONVERSION")
         println("="^70)
         
         hps = build_simple_jpc_system()
         
         # Convert to solver system
-        sys = to_solver_system(hps)
+        sys = to_solver_data(hps)
         
         # Check dimensions match
         @test length(sys.ac_buses) == length(hps.ac.buses)

@@ -1,8 +1,16 @@
 # Quickstart
 
+## Architecture Overview
+
+**HybridACDCPowerFlow v0.7.0** is a pure **application layer** that works with **JuliaPowerCase** (data layer):
+
+- **JuliaPowerCase**: Provides `HybridPowerSystem` and component types (data structures)
+- **HybridACDCPowerFlow**: Provides power flow algorithms (Newton-Raphson solvers)
+
 ## 1. Requirements
 
 - Julia `1.9+`
+- **JuliaPowerCase** v1.0+ (data structures)
 - Local package path: `HybridACDCPowerFlow`
 - For feasibility extension only: `JuMP`, `Ipopt`, `NLsolve`
 
@@ -24,9 +32,13 @@ Pkg.develop(path="/absolute/path/to/HybridACDCPowerFlow")
 ## 3. Solve a Built-In System
 
 ```julia
-using HybridACDCPowerFlow
+using JuliaPowerCase  # Data structures
+using HybridACDCPowerFlow  # Algorithms
 
+# Build a system (returns HybridPowerSystem from JuliaPowerCase)
 sys = build_ieee14_acdc()
+
+# Solve power flow
 result = solve_power_flow(sys; max_iter=50, tol=1e-8)
 
 println("converged=$(result.converged), iter=$(result.iterations), residual=$(result.residual)")
@@ -51,13 +63,20 @@ res_adaptive = solve_power_flow_adaptive(sys; options=options, Q_limits=Q_limits
 println(res_adaptive.converged)
 ```
 
-## 5. HybridPowerSystem Input (JuliaPowerCase)
+## 5. Build Custom HybridPowerSystem
 
 ```julia
 using JuliaPowerCase
 using HybridACDCPowerFlow
 
+# Define your AC and DC systems
+ac_sys = ACSystem(buses=[...], branches=[...], generators=[...])
+dc_sys = DCSystem(buses=[...], branches=[...])
+
+# Create HybridPowerSystem
 hps = HybridPowerSystem(ac=ac_sys, dc=dc_sys, vsc_converters=vscs, base_mva=100.0)
+
+# Solve
 res = solve_power_flow(hps)
 ```
 
@@ -67,3 +86,5 @@ res = solve_power_flow(hps)
 julia --project=HybridACDCPowerFlow HybridACDCPowerFlow/test/runtests.jl
 julia --project=HybridACDCPowerFlow HybridACDCPowerFlow/test/test_jpc_integration.jl
 ```
+
+All 65 tests should pass.

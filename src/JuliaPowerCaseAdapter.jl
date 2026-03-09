@@ -1,28 +1,29 @@
 # ═══════════════════════════════════════════════════════════════════════════════
 # JuliaPowerCaseAdapter.jl
 #
-# Provides seamless integration between JuliaPowerCase data structures and
-# HybridACDCPowerFlow solver. Enables using JuliaPowerCase.HybridPowerCaseData
-# directly with solve_power_flow().
+# LEGACY: Provides conversion from HybridPowerCaseData (matrix format) to
+# HybridPowerSystem (struct format). New users should build HybridPowerSystem
+# directly and use solve_power_flow(hps::HybridPowerSystem).
 #
-# v0.6.0: Updated to use shared JuliaPowerCase types (keyword constructors)
+# v0.7.0: Updated for SolverData internal representation
 # ═══════════════════════════════════════════════════════════════════════════════
 
-# Import only needed symbols to avoid conflicts with PowerSystem, detect_islands, etc.
+# Import only needed symbols to avoid conflicts
 using JuliaPowerCase: HybridPowerCaseData, PowerCaseData, AC, DC,
-                      Bus, Branch, Generator, VSCConverter,
+                      Bus, Branch, Generator, VSCConverter, HybridPowerSystem,
+                      PowerSystem as JPCPowerSystem,
                       BusType, PQ_BUS, PV_BUS, REF_BUS, ISOLATED_BUS,
                       GenModel, POLYNOMIAL_MODEL,
                       BusSchema, BranchSchema, GenSchema, DCBusSchema, DCBranchSchema, VSCSchema,
                       nrows, nbuses, nbranches
 
-using .PowerSystem: ACBus, ACBranch, DCBus, DCBranch, HybridSystem,
+using .PowerSystem: ACBus, ACBranch, DCBus, DCBranch, SolverData, to_solver_data,
                     PQ, PV, SLACK, PQ_MODE, VDC_Q, VDC_VAC
 
 # Import solve_power_flow to extend it with new method
 import .PowerSystem: solve_power_flow
 
-export to_hybrid_system, update_results!
+export to_hybrid_power_system, to_hybrid_system, update_results!
 
 # ═══════════════════════════════════════════════════════════════════════════════
 #  TYPE CONVERSION HELPERS
@@ -45,20 +46,28 @@ function _convert_control_mode(mode_int::Int)::Symbol
 end
 
 # ═══════════════════════════════════════════════════════════════════════════════
-#  CONVERSION: HybridPowerCaseData → HybridSystem
+#  CONVERSION: HybridPowerCaseData → HybridPowerSystem
 # ═══════════════════════════════════════════════════════════════════════════════
 
 """
-    to_hybrid_system(h::HybridPowerCaseData) -> HybridSystem
+    to_hybrid_power_system(h::HybridPowerCaseData) -> HybridPowerSystem
 
-Convert JuliaPowerCase `HybridPowerCaseData` to internal `HybridSystem` for power flow.
+Convert JuliaPowerCase `HybridPowerCaseData` (matrix format) to `HybridPowerSystem` 
+(struct format) for power flow analysis.
 
 # Notes
 - Bus IDs are remapped to contiguous 1:N indices
 - Generator power is extracted into separate Generator objects
 - Per-unit values converted to MW/MVar (using base_mva)
+
+# Example
+```juliausing JuliaPowerCase, HybridACDCPowerFlow
+hpcd = load_matpower("case14.m")  # Returns HybridPowerCaseData
+hps = to_hybrid_power_system(hpcd)  # Convert to HybridPowerSystem
+result = solve_power_flow(hps)      # Solve
+```
 """
-function to_hybrid_system(h::HybridPowerCaseData{T}) where T
+function to_hybrid_power_system(h::HybridPowerCaseData{T}) where T
     base_mva = Float64(h.base_mva)
     ac = h.ac
     
@@ -418,10 +427,37 @@ function to_hybrid_system(h::HybridPowerCaseData{T}) where T
         end
     end
     
-    # Build HybridSystem with generators
-    return HybridSystem(ac_buses, ac_branches, dc_buses, dc_branches, converters;
-                        generators=generators, baseMVA=base_mva)
+    # Build HybridPowerSystem
+    ac_sys = JPCPowerSystem{AC}(
+        buses = ac_buses,
+        branches = ac_branches,
+        generators = generators,
+        base_mva = base_mva,
+        name = "AC System"
+    )
+    
+    dc_sys = JPCPowerSystem{DC}(
+        buses = dc_buses,
+        branches = dc_branches,
+        base_mva = base_mva,
+        name = "DC System"
+    )
+    
+    return HybridPowerSystem(
+        ac = ac_sys,
+        dc = dc_sys,
+        vsc_converters = converters,
+        base_mva = base_mva,
+        name = "Hybrid System"
+    )
 end
+
+"""
+    to_hybrid_system(h::HybridPowerCaseData) -> HybridPowerSystem
+
+Legacy alias for `to_hybrid_power_system`. Kept for backward compatibility.
+"""
+to_hybrid_system = to_hybrid_power_system
 
 # ═══════════════════════════════════════════════════════════════════════════════
 #  UPDATE RESULTS BACK TO JuliaPowerCase

@@ -1,31 +1,39 @@
 """
     HybridACDCPowerFlow
 
-A Julia module for hybrid AC/DC power flow analysis supporting:
+A Julia module for hybrid AC/DC power flow analysis.
+
+# Architecture (v0.7.0 - Pure Application Layer)
+This module is a pure **application layer** that operates on data structures 
+from **JuliaPowerCase** (the information layer).
+
+ ## Key Features
 - AC power flow with Newton-Raphson solver
 - DC network with linear analysis
 - VSC converters with multiple control modes (PQ, VDC_Q, VDC_VAC)
-- IEEE test systems with HVDC extensions
-- **ENHANCED v0.2.0**: Island detection, PV→PQ conversion, auto swing bus selection, converter mode switching
-- **NEW v0.3.0**: Distributed slack bus model for realistic multi-generator control
-- **NEW v0.4.0**: Optimized sparse Jacobian, pre-allocated workspace, optional feasibility extension
-- **NEW v0.5.0**: Full JuliaPowerCase integration (shared types, keyword constructors)
+- IEEE test systems with HVDC extensions  
+- Island detection and adaptive solving
+- Distributed slack bus model
 
-Performance optimizations:
+## Performance Optimizations
 - Sparse Jacobian with pre-computed sparsity pattern
 - Sparse LU factorization with symbolic reuse (UMFPACK)
-- Pre-allocated SolverWorkspace with pre-computed entry map
-- @inbounds and sin/cos caching for inner loops
-- JuMP/Ipopt/NLsolve moved to optional extension
+- Pre-allocated solver workspace
+- @inbounds and sin/cos caching
 
-JuliaPowerCase integration (v0.5.0):
-- All types (ACBus, ACBranch, DCBus, DCBranch, VSCConverter, Generator)
-  imported directly from JuliaPowerCase
-- Converter control modes use Symbol (:pq, :vdc_q, :vdc_vac)
-- HybridSystem stores Generator objects separately from buses
+## Usage Pattern
+```julia
+using JuliaPowerCase, HybridACDCPowerFlow
+
+# Build or load system using JuliaPowerCase
+hps = build_ieee14_acdc()  # Returns HybridPowerSystem
+
+# Solve
+result = solve_power_flow(hps)  # Automatically creates internal solver workspace
+```
 
 Author: Tianyang Zhao
-Version: 0.5.0 (JuliaPowerCase Integration)
+Version: 0.7.0 (Pure Application Layer Architecture)
 """
 module HybridACDCPowerFlow
 
@@ -50,23 +58,25 @@ include("JuliaPowerCaseAdapter.jl")
 include("FeasibilityChecker.jl")
 
 # Re-export all public functions from base modules
-export ACBus, ACBranch, DCBus, DCBranch, VSCConverter, HybridSystem, Generator,
-       # JuliaPowerCase types (recommended for new code)
+export ACBus, ACBranch, DCBus, DCBranch, VSCConverter, Generator,
+       # JuliaPowerCase types (primary data structures)
        HybridPowerSystem, IslandInfo,
        BusType, PQ, PV, SLACK, PQ_MODE, VDC_Q, VDC_VAC,
-       build_admittance_matrix, solve_power_flow, power_flow_residual,
-       get_bus_voltages, get_branch_flows, rebuild_matrices!,
-       remove_ac_branch, extract_graph_data,
+       # DC bus types
+       DC_V, DC_P,
+       # Main solver functions
+       solve_power_flow, solve_dc_power_flow,
+       # Utility functions
+       get_bus_voltages, get_branch_flows,
+       # Test systems (return HybridPowerSystem)
        build_ieee14_acdc, build_ieee24_3area_acdc, build_ieee118_acdc, build_ac_only_version,
        build_case33bw_acdc, build_case33mg_acdc, build_case69_acdc,
        build_case300_acdc, build_case2000_acdc,
-       # Conversion functions
-       to_hybrid_system, update_results!, to_solver_system,
-       # Optimization exports
-       SolverWorkspace, create_solver_workspace, build_jacobian_triplets!,
-       compute_power_injections!
+       # Conversion functions (for legacy HybridPowerCaseData support)
+       to_hybrid_power_system, to_hybrid_system, update_results!,
+       to_solver_data
 
-# Re-export enhanced functions
+# Re-export enhanced functions  
 export detect_islands, solve_power_flow_islanded, solve_power_flow_adaptive,
        check_reactive_limits, pv_to_pq_conversion!, auto_select_swing_bus,
        auto_switch_converter_mode!, PowerFlowOptions, ReactiveLimit,

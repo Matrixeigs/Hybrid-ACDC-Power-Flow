@@ -57,8 +57,8 @@ using JuliaPowerCase: Branch, AC, DC, Bus, VSCConverter as JPC_VSC
         
         # Create N-2 fault (remove 2 branches)
         sys_fault = build_ieee14_acdc()
-        br1 = sys_fault.ac_branches[1]
-        sys_fault.ac_branches[1] = Branch{AC}(
+        br1 = sys_fault.ac.branches[1]
+        sys_fault.ac.branches[1] = Branch{AC}(
             index=br1.index, name=br1.name, from_bus=br1.from_bus, to_bus=br1.to_bus,
             in_service=false, branch_type=br1.branch_type, length_km=br1.length_km,
             n_parallel=br1.n_parallel, v_rated_kv=br1.v_rated_kv, s_rated_mva=br1.s_rated_mva,
@@ -70,8 +70,8 @@ using JuliaPowerCase: Branch, AC, DC, Bus, VSCConverter as JPC_VSC
             mtbf_hours=br1.mtbf_hours, mttr_hours=br1.mttr_hours, t_scheduled_h=br1.t_scheduled_h,
             sw_hours=br1.sw_hours, rp_hours=br1.rp_hours
         )
-        br3 = sys_fault.ac_branches[3]
-        sys_fault.ac_branches[3] = Branch{AC}(
+        br3 = sys_fault.ac.branches[3]
+        sys_fault.ac.branches[3] = Branch{AC}(
             index=br3.index, name=br3.name, from_bus=br3.from_bus, to_bus=br3.to_bus,
             in_service=false, branch_type=br3.branch_type, length_km=br3.length_km,
             n_parallel=br3.n_parallel, v_rated_kv=br3.v_rated_kv, s_rated_mva=br3.s_rated_mva,
@@ -148,9 +148,9 @@ using JuliaPowerCase: Branch, AC, DC, Bus, VSCConverter as JPC_VSC
         # Radial topology (break loops)
         sys_radial = build_ieee14_acdc()
         for idx in [7, 10, 15]
-            if idx <= length(sys_radial.ac_branches)
-                br = sys_radial.ac_branches[idx]
-                sys_radial.ac_branches[idx] = Branch{AC}(
+            if idx <= length(sys_radial.ac.branches)
+                br = sys_radial.ac.branches[idx]
+                sys_radial.ac.branches[idx] = Branch{AC}(
                     index=br.index, name=br.name, from_bus=br.from_bus, to_bus=br.to_bus,
                     in_service=false, branch_type=br.branch_type, length_km=br.length_km,
                     n_parallel=br.n_parallel, v_rated_kv=br.v_rated_kv, s_rated_mva=br.s_rated_mva,
@@ -185,7 +185,7 @@ using JuliaPowerCase: Branch, AC, DC, Bus, VSCConverter as JPC_VSC
         println("="^70)
         
         sys = build_ieee24_3area_acdc()
-        n_ac = length(sys.ac_buses)
+        n_ac = length(sys.ac.buses)
         
         # Compute graph diameters using BFS
         function compute_diameter(adj::Matrix{Int})
@@ -212,14 +212,14 @@ using JuliaPowerCase: Branch, AC, DC, Bus, VSCConverter as JPC_VSC
         
         # Pure AC adjacency
         adj_ac = zeros(Int, n_ac, n_ac)
-        for br in sys.ac_branches
+        for br in sys.ac.branches
             br.in_service && (adj_ac[br.from_bus, br.to_bus] = adj_ac[br.to_bus, br.from_bus] = 1)
         end
         D_ac = compute_diameter(adj_ac)
         
         # AC+DC hybrid (converters create shortcuts)
         adj_hybrid = copy(adj_ac)
-        for c1 in sys.converters, c2 in sys.converters
+        for c1 in sys.vsc_converters, c2 in sys.vsc_converters
             if c1.in_service && c2.in_service && c1.bus_ac != c2.bus_ac
                 adj_hybrid[c1.bus_ac, c2.bus_ac] = adj_hybrid[c2.bus_ac, c1.bus_ac] = 1
             end
@@ -243,9 +243,9 @@ using JuliaPowerCase: Branch, AC, DC, Bus, VSCConverter as JPC_VSC
         
         # Scenario A: PQ mode with Pset=0.3 (p.u.)
         sys_A = build_ieee14_acdc()
-        c = sys_A.converters[1]
+        c = sys_A.vsc_converters[1]
         # Set P=30 MW, Q=5 MVAr on baseMVA=100
-        sys_A.converters[1] = VSCConverter(
+        sys_A.vsc_converters[1] = VSCConverter(
             index=c.index, name=c.name, bus_ac=c.bus_ac, bus_dc=c.bus_dc,
             in_service=true, vsc_type=c.vsc_type, p_rated_mw=c.p_rated_mw,
             vn_ac_kv=c.vn_ac_kv, vn_dc_kv=c.vn_dc_kv, p_mw=0.0, q_mvar=0.0,
@@ -260,7 +260,7 @@ using JuliaPowerCase: Branch, AC, DC, Bus, VSCConverter as JPC_VSC
         
         # Scenario B: Unknown parameter change (Pset=0.8 p.u. = 80 MW)
         sys_B = build_ieee14_acdc()
-        sys_B.converters[1] = VSCConverter(
+        sys_B.vsc_converters[1] = VSCConverter(
             index=c.index, name=c.name, bus_ac=c.bus_ac, bus_dc=c.bus_dc,
             in_service=true, vsc_type=c.vsc_type, p_rated_mw=c.p_rated_mw,
             vn_ac_kv=c.vn_ac_kv, vn_dc_kv=c.vn_dc_kv, p_mw=0.0, q_mvar=0.0,
@@ -300,8 +300,8 @@ using JuliaPowerCase: Branch, AC, DC, Bus, VSCConverter as JPC_VSC
         println("="^70)
         
         sys_pq = build_ieee24_3area_acdc()
-        c = sys_pq.converters[1]
-        sys_pq.converters[1] = VSCConverter(
+        c = sys_pq.vsc_converters[1]
+        sys_pq.vsc_converters[1] = VSCConverter(
             index=c.index, name=c.name, bus_ac=c.bus_ac, bus_dc=c.bus_dc,
             in_service=true, vsc_type=c.vsc_type, p_rated_mw=c.p_rated_mw,
             vn_ac_kv=c.vn_ac_kv, vn_dc_kv=c.vn_dc_kv, p_mw=0.0, q_mvar=0.0,
@@ -315,7 +315,7 @@ using JuliaPowerCase: Branch, AC, DC, Bus, VSCConverter as JPC_VSC
         res_pq = solve_power_flow(sys_pq)
         
         sys_vac = build_ieee24_3area_acdc()
-        sys_vac.converters[1] = VSCConverter(
+        sys_vac.vsc_converters[1] = VSCConverter(
             index=c.index, name=c.name, bus_ac=c.bus_ac, bus_dc=c.bus_dc,
             in_service=true, vsc_type=c.vsc_type, p_rated_mw=c.p_rated_mw,
             vn_ac_kv=c.vn_ac_kv, vn_dc_kv=c.vn_dc_kv, p_mw=0.0, q_mvar=0.0,
@@ -354,9 +354,9 @@ using JuliaPowerCase: Branch, AC, DC, Bus, VSCConverter as JPC_VSC
         # Helper: scale all loads in a system
         function scale_loads(sys, factor)
             sys_scaled = build_ieee14_acdc()
-            for i in 1:length(sys_scaled.ac_buses)
-                b = sys_scaled.ac_buses[i]
-                sys_scaled.ac_buses[i] = Bus{AC}(
+            for i in 1:length(sys_scaled.ac.buses)
+                b = sys_scaled.ac.buses[i]
+                sys_scaled.ac.buses[i] = Bus{AC}(
                     index=b.index, name=b.name, bus_id=b.bus_id, in_service=b.in_service,
                     base_kv=b.base_kv, bus_type=b.bus_type, vm_pu=b.vm_pu, va_deg=b.va_deg,
                     vmax_pu=b.vmax_pu, vmin_pu=b.vmin_pu,
@@ -402,8 +402,8 @@ using JuliaPowerCase: Branch, AC, DC, Bus, VSCConverter as JPC_VSC
         
         # Disable branches 4 and 5 (typically connects different parts)
         for idx in [4, 5]
-            br = sys_2island.ac_branches[idx]
-            sys_2island.ac_branches[idx] = Branch{AC}(
+            br = sys_2island.ac.branches[idx]
+            sys_2island.ac.branches[idx] = Branch{AC}(
                 index=br.index, name=br.name, from_bus=br.from_bus, to_bus=br.to_bus,
                 in_service=false, branch_type=br.branch_type, length_km=br.length_km,
                 n_parallel=br.n_parallel, v_rated_kv=br.v_rated_kv, s_rated_mva=br.s_rated_mva,
@@ -431,8 +431,8 @@ using JuliaPowerCase: Branch, AC, DC, Bus, VSCConverter as JPC_VSC
         # Test 2: Severe islanding (disable more branches)
         sys_severe = build_ieee14_acdc()
         for idx in [2, 4, 7, 10]  # Multiple critical branches
-            br = sys_severe.ac_branches[idx]
-            sys_severe.ac_branches[idx] = Branch{AC}(
+            br = sys_severe.ac.branches[idx]
+            sys_severe.ac.branches[idx] = Branch{AC}(
                 index=br.index, name=br.name, from_bus=br.from_bus, to_bus=br.to_bus,
                 in_service=false, branch_type=br.branch_type, length_km=br.length_km,
                 n_parallel=br.n_parallel, v_rated_kv=br.v_rated_kv, s_rated_mva=br.s_rated_mva,
@@ -474,10 +474,10 @@ using JuliaPowerCase: Branch, AC, DC, Bus, VSCConverter as JPC_VSC
         
         for (mode, mode_name, p_set, q_set) in control_modes
             sys = build_ieee14_acdc()
-            c = sys.converters[1]
+            c = sys.vsc_converters[1]
             
             # Update converter with new control mode
-            sys.converters[1] = VSCConverter(
+            sys.vsc_converters[1] = VSCConverter(
                 index=c.index, name=c.name, bus_ac=c.bus_ac, bus_dc=c.bus_dc,
                 in_service=true, vsc_type=c.vsc_type, p_rated_mw=c.p_rated_mw,
                 vn_ac_kv=c.vn_ac_kv, vn_dc_kv=c.vn_dc_kv, p_mw=0.0, q_mvar=0.0,
@@ -505,12 +505,12 @@ using JuliaPowerCase: Branch, AC, DC, Bus, VSCConverter as JPC_VSC
         
         # Test mixed modes with 2 converters
         sys_mixed = build_ieee24_3area_acdc()
-        if length(sys_mixed.converters) >= 2
-            c1 = sys_mixed.converters[1]
-            c2 = sys_mixed.converters[2]
+        if length(sys_mixed.vsc_converters) >= 2
+            c1 = sys_mixed.vsc_converters[1]
+            c2 = sys_mixed.vsc_converters[2]
             
             # Conv1: PQ mode, Conv2: VDC_Q mode
-            sys_mixed.converters[1] = VSCConverter(
+            sys_mixed.vsc_converters[1] = VSCConverter(
                 index=c1.index, name=c1.name, bus_ac=c1.bus_ac, bus_dc=c1.bus_dc,
                 in_service=true, vsc_type=c1.vsc_type, p_rated_mw=c1.p_rated_mw,
                 vn_ac_kv=c1.vn_ac_kv, vn_dc_kv=c1.vn_dc_kv, p_mw=0.0, q_mvar=0.0,
@@ -521,7 +521,7 @@ using JuliaPowerCase: Branch, AC, DC, Bus, VSCConverter as JPC_VSC
                 v_ac_set_pu=1.0, v_dc_set_pu=1.0, k_vdc=c1.k_vdc, k_p=0.0, k_q=0.0,
                 v_ref_pu=1.0, f_ref_hz=50.0, mtbf_hours=0.0, mttr_hours=0.0, t_scheduled_h=0.0
             )
-            sys_mixed.converters[2] = VSCConverter(
+            sys_mixed.vsc_converters[2] = VSCConverter(
                 index=c2.index, name=c2.name, bus_ac=c2.bus_ac, bus_dc=c2.bus_dc,
                 in_service=true, vsc_type=c2.vsc_type, p_rated_mw=c2.p_rated_mw,
                 vn_ac_kv=c2.vn_ac_kv, vn_dc_kv=c2.vn_dc_kv, p_mw=0.0, q_mvar=0.0,
@@ -558,9 +558,9 @@ using JuliaPowerCase: Branch, AC, DC, Bus, VSCConverter as JPC_VSC
         
         for cfg in loss_configs
             sys = build_ieee14_acdc()
-            c = sys.converters[1]
+            c = sys.vsc_converters[1]
             
-            sys.converters[1] = VSCConverter(
+            sys.vsc_converters[1] = VSCConverter(
                 index=c.index, name=c.name, bus_ac=c.bus_ac, bus_dc=c.bus_dc,
                 in_service=true, vsc_type=c.vsc_type, p_rated_mw=c.p_rated_mw,
                 vn_ac_kv=c.vn_ac_kv, vn_dc_kv=c.vn_dc_kv, p_mw=0.0, q_mvar=0.0,
@@ -596,8 +596,8 @@ using JuliaPowerCase: Branch, AC, DC, Bus, VSCConverter as JPC_VSC
         
         # Test zero-loss ideal converter
         sys_ideal = build_ieee14_acdc()
-        c = sys_ideal.converters[1]
-        sys_ideal.converters[1] = VSCConverter(
+        c = sys_ideal.vsc_converters[1]
+        sys_ideal.vsc_converters[1] = VSCConverter(
             index=c.index, name=c.name, bus_ac=c.bus_ac, bus_dc=c.bus_dc,
             in_service=true, vsc_type=c.vsc_type, p_rated_mw=c.p_rated_mw,
             vn_ac_kv=c.vn_ac_kv, vn_dc_kv=c.vn_dc_kv, p_mw=0.0, q_mvar=0.0,

@@ -6,14 +6,15 @@ Systems range from small distribution (33-bus) to large transmission (2000-bus):
   IEEE14+DC, IEEE24+DC, IEEE118+DC  (hand-crafted)
   Case33bw+DC, Case33mg+DC, Case69+DC, Case300+DC, Case2000+DC  (parsed from MATPOWER)
 
-v0.6.0: Updated to use JuliaPowerCase types with keyword constructors.
+v0.7.0: Updated to return JuliaPowerCase.HybridPowerSystem (pure data structures).
 """
 module TestSystems
 
 using JuliaPowerCase: Bus, Branch, Generator, VSCConverter, AC, DC,
                       BusType, PQ_BUS, PV_BUS, REF_BUS, ISOLATED_BUS,
-                      GenModel, POLYNOMIAL_MODEL
-using ..PowerSystem: ACBus, ACBranch, DCBus, DCBranch, HybridSystem,
+                      GenModel, POLYNOMIAL_MODEL,
+                      PowerSystem, HybridPowerSystem
+using ..PowerSystem: ACBus, ACBranch, DCBus, DCBranch,
                      PQ, PV, SLACK, PQ_MODE, VDC_Q, VDC_VAC
 using ..MatpowerParser: parse_matpower, MatpowerData
 
@@ -26,6 +27,38 @@ export build_ieee14_acdc, build_ieee24_3area_acdc, build_ieee118_acdc, build_ac_
 # ═══════════════════════════════════════════════════════════════════════════════
 
 const _BASEMVA = 100.0  # Default base MVA for test systems
+
+"""
+    _build_hybrid_power_system(ac_buses, ac_branches, dc_buses, dc_branches, 
+                               converters, generators; baseMVA=100.0)
+
+Construct a HybridPowerSystem from component vectors.
+"""
+function _build_hybrid_power_system(ac_buses, ac_branches, dc_buses, dc_branches,
+                                    converters, generators; baseMVA=_BASEMVA)
+    ac_sys = PowerSystem{AC}(
+        buses = ac_buses,
+        branches = ac_branches,
+        generators = generators,
+        base_mva = baseMVA,
+        name = "AC System"
+    )
+    
+    dc_sys = PowerSystem{DC}(
+        buses = dc_buses,
+        branches = dc_branches,
+        base_mva = baseMVA,
+        name = "DC System"
+    )
+    
+    return HybridPowerSystem(
+        ac = ac_sys,
+        dc = dc_sys,
+        vsc_converters = converters,
+        base_mva = baseMVA,
+        name = "Hybrid AC/DC Test System"
+    )
+end
 
 """
     _ac_bus(id, type, Pd_pu, Qd_pu, Vm, Va_rad, area; baseMVA=100.0)
@@ -364,8 +397,8 @@ function build_ieee14_acdc()
              0.001, 0.01, 0.001, 1.0, true),   # Bus 9 → DC bus 2
     ]
 
-    return HybridSystem(ac_buses, ac_branches, dc_buses, dc_branches, converters;
-                        generators=generators)
+    return _build_hybrid_power_system(ac_buses, ac_branches, dc_buses, dc_branches,
+                                      converters, generators)
 end
 
 # ─── IEEE 24-bus RTS, 3-area hybrid AC/DC ────────────────────────────────────
@@ -494,8 +527,8 @@ function build_ieee24_3area_acdc()
              0.001, 0.01, 0.001, 2.0, true),    # Area 3
     ]
 
-    return HybridSystem(ac_buses, ac_branches, dc_buses, dc_branches, converters;
-                        generators=generators)
+    return _build_hybrid_power_system(ac_buses, ac_branches, dc_buses, dc_branches,
+                                      converters, generators)
 end
 
 # ─── IEEE 118-bus hybrid AC/DC (large) ───────────────────────────────────────
@@ -708,19 +741,34 @@ function build_ieee118_acdc()
         ))
     end
 
-    return HybridSystem(ac_buses, ac_branches, dc_buses, dc_branches, converters;
-                        generators=generators)
+    return _build_hybrid_power_system(ac_buses, ac_branches, dc_buses, dc_branches,
+                                      converters, generators)
 end
 
 # ─── AC-only version for comparison ──────────────────────────────────────────
 
 """
+    build_ac_only_version(sys::HybridPowerSystem) -> HybridPowerSystem
+
 Strip DC components for AC-only baseline comparison.
 """
-function build_ac_only_version(sys::HybridSystem)
-    return HybridSystem(copy(sys.ac_buses), copy(sys.ac_branches),
-                        Bus{DC}[], Branch{DC}[], VSCConverter[];
-                        generators=copy(sys.generators), baseMVA=sys.baseMVA)
+function build_ac_only_version(sys::HybridPowerSystem)
+    ac_sys = PowerSystem{AC}(
+        buses = copy(sys.ac.buses),
+        branches = copy(sys.ac.branches),
+        generators = copy(sys.ac.generators),
+        base_mva = sys.base_mva,
+        name = "$(sys.ac.name) AC-only"
+    )
+    dc_sys = PowerSystem{DC}(base_mva = sys.base_mva, name = "Empty DC")
+    
+    return HybridPowerSystem(
+        ac = ac_sys,
+        dc = dc_sys,
+        vsc_converters = VSCConverter[],
+        base_mva = sys.base_mva,
+        name = "$(sys.name) AC-only"
+    )
 end
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -842,8 +890,8 @@ function build_case33bw_acdc()
              0.001, 0.01, 0.001, 0.5, true),
     ]
 
-    return HybridSystem(ac_buses, ac_branches, dc_buses, dc_branches, converters;
-                        generators=generators, baseMVA=baseMVA)
+    return _build_hybrid_power_system(ac_buses, ac_branches, dc_buses, dc_branches,
+                        converters, generators, baseMVA=baseMVA)
 end
 
 # ─── 33-bus (Kashem microgrid variant) + HVDC ────────────────────────────────
@@ -880,8 +928,8 @@ function build_case33mg_acdc()
              0.001, 0.01, 0.001, 0.5, true),
     ]
 
-    return HybridSystem(ac_buses, ac_branches, dc_buses, dc_branches, converters;
-                        generators=generators, baseMVA=baseMVA)
+    return _build_hybrid_power_system(ac_buses, ac_branches, dc_buses, dc_branches,
+                        converters, generators, baseMVA=baseMVA)
 end
 
 # ─── 69-bus distribution system + HVDC ───────────────────────────────────────
@@ -925,8 +973,8 @@ function build_case69_acdc()
              0.001, 0.01, 0.001, 2.0, true),
     ]
 
-    return HybridSystem(ac_buses, ac_branches, dc_buses, dc_branches, converters;
-                        generators=generators, baseMVA=baseMVA)
+    return _build_hybrid_power_system(ac_buses, ac_branches, dc_buses, dc_branches,
+                        converters, generators, baseMVA=baseMVA)
 end
 
 # ─── IEEE 300-bus transmission system + MTDC overlay ─────────────────────────
@@ -993,8 +1041,8 @@ function build_case300_acdc()
              0.001, 0.01, 0.001, 3.0, true),
     ]
 
-    return HybridSystem(ac_buses, ac_branches, dc_buses, dc_branches, converters;
-                        generators=generators, baseMVA=baseMVA)
+    return _build_hybrid_power_system(ac_buses, ac_branches, dc_buses, dc_branches,
+                        converters, generators, baseMVA=baseMVA)
 end
 
 # ─── ACTIVSg 2000-bus Texas synthetic + MTDC backbone ────────────────────────
@@ -1075,8 +1123,8 @@ function build_case2000_acdc()
         ))
     end
 
-    return HybridSystem(ac_buses, ac_branches, dc_buses, dc_branches, converters;
-                        generators=generators, baseMVA=baseMVA)
+    return _build_hybrid_power_system(ac_buses, ac_branches, dc_buses, dc_branches,
+                        converters, generators, baseMVA=baseMVA)
 end
 
 end  # module TestSystems
