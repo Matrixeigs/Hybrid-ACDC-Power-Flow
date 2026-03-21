@@ -72,6 +72,7 @@ export ACBus, ACBranch, DCBus, DCBranch, VSCConverter, Generator,
        build_ieee14_acdc, build_ieee24_3area_acdc, build_ieee118_acdc, build_ac_only_version,
        build_case33bw_acdc, build_case33mg_acdc, build_case69_acdc,
        build_case300_acdc, build_case2000_acdc,
+       build_from_matpower,
        # Conversion functions (for legacy HybridPowerCaseData support)
        to_hybrid_power_system, to_hybrid_system, update_results!,
        to_solver_data

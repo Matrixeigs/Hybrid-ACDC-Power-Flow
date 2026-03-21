@@ -171,6 +171,9 @@ function to_hybrid_power_system(h::HybridPowerCaseData{T}) where T
         Va_deg = Float64(ac.bus[i, :VA])
         area = Int(ac.bus[i, :AREA])
         
+        Gs_mw   = Float64(ac.bus[i, :GS])
+        Bs_mvar = Float64(ac.bus[i, :BS])
+
         push!(ac_buses, Bus{AC}(
             index      = i,
             name       = "Bus$i",
@@ -184,8 +187,8 @@ function to_hybrid_power_system(h::HybridPowerCaseData{T}) where T
             vmin_pu    = 0.9,
             pd_mw      = Pd_mw,
             qd_mvar    = Qd_mvar,
-            gs_mw      = 0.0,
-            bs_mvar    = 0.0,
+            gs_mw      = Gs_mw,
+            bs_mvar    = Bs_mvar,
             area       = area,
             zone       = 1,
             carbon_area = 1,

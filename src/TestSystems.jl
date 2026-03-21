@@ -20,7 +20,8 @@ using ..MatpowerParser: parse_matpower, MatpowerData
 
 export build_ieee14_acdc, build_ieee24_3area_acdc, build_ieee118_acdc, build_ac_only_version,
        build_case33bw_acdc, build_case33mg_acdc, build_case69_acdc,
-       build_case300_acdc, build_case2000_acdc
+       build_case300_acdc, build_case2000_acdc,
+       build_from_matpower
 
 # ═══════════════════════════════════════════════════════════════════════════════
 #  HELPER FUNCTIONS FOR TEST SYSTEM CONSTRUCTION
@@ -61,11 +62,12 @@ function _build_hybrid_power_system(ac_buses, ac_branches, dc_buses, dc_branches
 end
 
 """
-    _ac_bus(id, type, Pd_pu, Qd_pu, Vm, Va_rad, area; baseMVA=100.0)
+    _ac_bus(id, type, Pd_pu, Qd_pu, Vm, Va_rad, area; gs_mw=0.0, bs_mvar=0.0, baseMVA=100.0)
 
 Create an AC bus for test systems. Power values in per-unit on baseMVA.
 """
-function _ac_bus(id::Int, type::BusType, Pd_pu, Qd_pu, Vm, Va_rad, area; baseMVA=_BASEMVA)
+function _ac_bus(id::Int, type::BusType, Pd_pu, Qd_pu, Vm, Va_rad, area;
+                 gs_mw=0.0, bs_mvar=0.0, baseMVA=_BASEMVA)
     Bus{AC}(
         index      = id,
         name       = "Bus$id",
@@ -79,8 +81,8 @@ function _ac_bus(id::Int, type::BusType, Pd_pu, Qd_pu, Vm, Va_rad, area; baseMVA
         vmin_pu    = 0.9,
         pd_mw      = Float64(Pd_pu) * baseMVA,
         qd_mvar    = Float64(Qd_pu) * baseMVA,
-        gs_mw      = 0.0,
-        bs_mvar    = 0.0,
+        gs_mw      = Float64(gs_mw),
+        bs_mvar    = Float64(bs_mvar),
         area       = area,
         zone       = 1,
         carbon_area = 1,
@@ -818,11 +820,14 @@ function _matpower_to_ac(mpd::MatpowerData)
         btype = orig_type == 3 ? SLACK : (orig_type == 2 ? PV : PQ)
         Pd = mpd.bus[i, 3] / mpd.baseMVA   # MW → p.u.
         Qd = mpd.bus[i, 4] / mpd.baseMVA
+        Gs = size(mpd.bus, 2) >= 5 ? mpd.bus[i, 5] : 0.0   # MW shunt conductance
+        Bs = size(mpd.bus, 2) >= 6 ? mpd.bus[i, 6] : 0.0   # MVAR shunt susceptance
         area = size(mpd.bus, 2) >= 7 ? Int(mpd.bus[i, 7]) : 1
         Vm = bus_has_gen[i] ? bus_Vg[i] : mpd.bus[i, 8]
         Va = size(mpd.bus, 2) >= 9 ? deg2rad(mpd.bus[i, 9]) : 0.0
 
-        ac_buses[i] = _ac_bus(i, btype, Pd, Qd, Vm, Va, area; baseMVA=mpd.baseMVA)
+        ac_buses[i] = _ac_bus(i, btype, Pd, Qd, Vm, Va, area;
+                              gs_mw=Gs, bs_mvar=Bs, baseMVA=mpd.baseMVA)
         
         # Create generator if bus has generation
         if bus_has_gen[i]
@@ -1125,6 +1130,35 @@ function build_case2000_acdc()
 
     return _build_hybrid_power_system(ac_buses, ac_branches, dc_buses, dc_branches,
                         converters, generators, baseMVA=baseMVA)
+end
+
+# ─── Generic Matpower case loader (AC-only) ──────────────────────────────────
+
+"""
+    build_from_matpower(filepath::String) -> HybridPowerSystem
+
+Parse a MATPOWER .m file and return an **AC-only** `HybridPowerSystem` suitable
+for power flow with `solve_power_flow`. Load/generation data and shunt admittances
+(Gs, Bs) are fully preserved.
+
+# Examples
+```julia
+sys = build_from_matpower("data/case118.m")
+result = solve_power_flow(sys)
+```
+"""
+function build_from_matpower(filepath::String)
+    mpd = parse_matpower(filepath)
+    ac_buses, ac_branches, generators, baseMVA = _matpower_to_ac(mpd)
+
+    return _build_hybrid_power_system(
+        ac_buses, ac_branches,
+        DCBus[],        # no DC buses
+        Branch{DC}[],   # no DC branches
+        VSCConverter[], # no converters
+        generators;
+        baseMVA = baseMVA
+    )
 end
 
 end  # module TestSystems

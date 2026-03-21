@@ -254,7 +254,7 @@ function build_admittance_matrix(sys::SolverData)
     J = Vector{Int}(undef, nnz_est)
     V = Vector{ComplexF64}(undef, nnz_est)
     
-    # Diagonal entries first
+    # Diagonal entries first (branches + bus shunts)
     diag_vals = zeros(ComplexF64, n)
     idx = 0
     
@@ -265,7 +265,7 @@ function build_admittance_matrix(sys::SolverData)
         yc = im * br.b_pu / 2.0
         tap = br.tap == 0.0 ? 1.0 : br.tap
         
-        # Diagonal contributions
+        # Diagonal contributions from branch
         diag_vals[i] += ys / tap^2 + yc
         diag_vals[j] += ys + yc
         
@@ -273,6 +273,13 @@ function build_admittance_matrix(sys::SolverData)
         off_diag = -ys / tap
         idx += 1; I[idx] = i; J[idx] = j; V[idx] = off_diag
         idx += 1; I[idx] = j; J[idx] = i; V[idx] = off_diag
+    end
+    
+    # Add bus shunt admittances to diagonal (Gs + j*Bs in MW/MVAR → divide by baseMVA for pu)
+    for (i, bus) in enumerate(sys.ac_buses)
+        if bus.gs_mw != 0.0 || bus.bs_mvar != 0.0
+            diag_vals[i] += complex(bus.gs_mw, bus.bs_mvar) / sys.baseMVA
+        end
     end
     
     # Add diagonal entries
