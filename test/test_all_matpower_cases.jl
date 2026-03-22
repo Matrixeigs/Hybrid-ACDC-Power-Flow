@@ -77,9 +77,9 @@ end
 # ---------------------------------------------------------------------------
 # Run power flow on all cases
 # ---------------------------------------------------------------------------
-passed = 0
-failed = 0
-skipped = 0
+passed = Ref(0)
+failed = Ref(0)
+skipped = Ref(0)
 failed_cases = String[]
 
 @testset "All Matpower Cases" begin
@@ -95,7 +95,7 @@ failed_cases = String[]
             @testset "$name" begin
                 @test_skip "Skipping large case ($nbus_approx buses)"
             end
-            skipped += 1
+            skipped[] += 1
             continue
         end
 
@@ -116,7 +116,7 @@ failed_cases = String[]
             @test parse_ok
             if !parse_ok
                 @printf("  ❌ %-40s  %s\n", name, err_msg)
-                failed += 1
+                failed[] += 1
                 push!(failed_cases, name * " [PARSE]")
                 return
             end
@@ -133,7 +133,7 @@ failed_cases = String[]
             @test solve_ok
             if !solve_ok
                 @printf("  ❌ %-40s  %s\n", name, err_msg)
-                failed += 1
+                failed[] += 1
                 push!(failed_cases, name * " [SOLVE]")
                 return
             end
@@ -145,11 +145,11 @@ failed_cases = String[]
                 @printf("  ✅ %-40s  iters=%3d  Vm=[%.4f, %.4f]\n",
                         name, result.iterations,
                         minimum(result.Vm), maximum(result.Vm))
-                passed += 1
+                passed[] += 1
             else
                 @printf("  ⚠️  %-40s  DID NOT CONVERGE (iters=%d, res=%.2e)\n",
                         name, result.iterations, result.residual)
-                failed += 1
+                failed[] += 1
                 push!(failed_cases, name * " [NO CONV]")
             end
         end
@@ -160,10 +160,10 @@ println()
 println("="^70)
 println("  SUMMARY")
 println("="^70)
-@printf("  Passed:  %d\n", passed)
-@printf("  Failed:  %d\n", failed)
-@printf("  Skipped: %d (>25k buses)\n", skipped)
-@printf("  Total:   %d\n", passed + failed + skipped)
+@printf("  Passed:  %d\n", passed[])
+@printf("  Failed:  %d\n", failed[])
+@printf("  Skipped: %d (>25k buses)\n", skipped[])
+@printf("  Total:   %d\n", passed[] + failed[] + skipped[])
 
 if !isempty(failed_cases)
     println("\n  Failed cases:")

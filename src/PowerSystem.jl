@@ -263,16 +263,23 @@ function build_admittance_matrix(sys::SolverData)
         i, j = br.from_bus, br.to_bus
         ys = 1.0 / complex(br.r_pu, br.x_pu)
         yc = im * br.b_pu / 2.0
-        tap = br.tap == 0.0 ? 1.0 : br.tap
+        tap_mag = br.tap == 0.0 ? 1.0 : br.tap
+        shift_rad = deg2rad(br.shift_deg)
+        # Complex tap: t = |tap| * exp(j*shift)  (MATPOWER convention: from-bus = tap end)
+        t = tap_mag * complex(cos(shift_rad), sin(shift_rad))
+        t2 = tap_mag^2  # |t|^2
         
-        # Diagonal contributions from branch
-        diag_vals[i] += ys / tap^2 + yc
+        # Standard Ybus model for phase-shifting transformer:
+        #   Y[i,i] += ys / |t|^2 + y_c
+        #   Y[j,j] += ys + y_c
+        #   Y[i,j] += -ys / conj(t)
+        #   Y[j,i] += -ys / t
+        diag_vals[i] += ys / t2 + yc
         diag_vals[j] += ys + yc
         
-        # Off-diagonal entries
-        off_diag = -ys / tap
-        idx += 1; I[idx] = i; J[idx] = j; V[idx] = off_diag
-        idx += 1; I[idx] = j; J[idx] = i; V[idx] = off_diag
+        # Off-diagonal entries (asymmetric for phase shifters)
+        idx += 1; I[idx] = i; J[idx] = j; V[idx] = -ys / conj(t)
+        idx += 1; I[idx] = j; J[idx] = i; V[idx] = -ys / t
     end
     
     # Add bus shunt admittances to diagonal (Gs + j*Bs in MW/MVAR → divide by baseMVA for pu)

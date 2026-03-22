@@ -31,8 +31,46 @@ end
 _strip_comment(s::AbstractString) = let i = findfirst('%', s); i === nothing ? s : s[1:i-1] end
 
 """
+Evaluate simple MATLAB math expressions like `135/sqrt(3)`, `50/3`, `sqrt(3)`.
+Returns the Float64 value or `nothing` if the expression is not recognized.
+"""
+function _eval_simple_expr(s::AbstractString)::Union{Float64, Nothing}
+    # Direct parse
+    v = tryparse(Float64, s)
+    v !== nothing && return v
+    # a/sqrt(b)
+    m = match(r"^(-?[\d.eE+\-]+)/sqrt\((-?[\d.eE+\-]+)\)$", s)
+    if m !== nothing
+        a = tryparse(Float64, m.captures[1])
+        b = tryparse(Float64, m.captures[2])
+        a !== nothing && b !== nothing && b > 0 && return a / sqrt(b)
+    end
+    # sqrt(a)/b
+    m = match(r"^sqrt\((-?[\d.eE+\-]+)\)/(-?[\d.eE+\-]+)$", s)
+    if m !== nothing
+        a = tryparse(Float64, m.captures[1])
+        b = tryparse(Float64, m.captures[2])
+        a !== nothing && b !== nothing && b != 0 && return sqrt(a) / b
+    end
+    # sqrt(a)
+    m = match(r"^sqrt\((-?[\d.eE+\-]+)\)$", s)
+    if m !== nothing
+        a = tryparse(Float64, m.captures[1])
+        a !== nothing && return sqrt(a)
+    end
+    # a/b
+    m = match(r"^(-?[\d.eE+\-]+)/(-?[\d.eE+\-]+)$", s)
+    if m !== nothing
+        a = tryparse(Float64, m.captures[1])
+        b = tryparse(Float64, m.captures[2])
+        a !== nothing && b !== nothing && b != 0 && return a / b
+    end
+    return nothing
+end
+
+"""
 Collect all content between the first '[' and the matching ']' in `lines`
-starting from `start_line`. Returns the raw content string.
+starting from `start_line`. Returns the raw content string with newlines preserved.
 """
 function _collect_block_content(lines::Vector{<:AbstractString}, start_line::Int)
     content = IOBuffer()
@@ -48,9 +86,10 @@ function _collect_block_content(lines::Vector{<:AbstractString}, start_line::Int
         close_pos = findfirst(']', raw)
         if close_pos !== nothing
             write(content, raw[1:close_pos-1])
+            write(content, "\n")  # ensure last line is terminated
             break
         else
-            write(content, raw, " ")
+            write(content, raw, "\n")  # preserve newlines as row delimiters
         end
     end
     return String(take!(content))
@@ -58,20 +97,27 @@ end
 
 """
 Parse a block content string (between '[' and ']') into a Matrix{Float64}.
-Semicolons delimit rows; whitespace/commas delimit values within a row.
+Both semicolons and newlines delimit rows; whitespace/commas delimit values
+within a row. Simple MATLAB math expressions (e.g. `135/sqrt(3)`) are evaluated.
 """
 function _parse_block_content(content::String)
     rows = Vector{Float64}[]
-    # Replace commas with spaces and split on semicolons
-    for row_str in split(content, ';')
+    # Split on BOTH semicolons and newlines so that rows without trailing
+    # semicolons (valid in MATPOWER, e.g. bus 1 in some files) are handled.
+    for row_str in split(content, r"[;\n]")
         # Replace commas used as separators with spaces
         row_str = replace(row_str, ',' => ' ')
         row_str = strip(row_str)
         isempty(row_str) && continue
         # Handle MATLAB line continuation dots
         row_str = replace(row_str, "..." => " ")
-        vals = [tryparse(Float64, s) for s in split(row_str) if !isempty(s)]
-        parsed = Float64[v for v in vals if v !== nothing]
+        # Evaluate each token, including simple math expressions
+        parsed = Float64[]
+        for s in split(row_str)
+            isempty(s) && continue
+            v = _eval_simple_expr(s)
+            v !== nothing && push!(parsed, v)
+        end
         isempty(parsed) && continue
         push!(rows, parsed)
     end
@@ -109,10 +155,13 @@ function parse_matpower(filepath::String)
     while i <= length(lines)
         raw = strip(_strip_comment(lines[i]))
 
-        # baseMVA
+        # baseMVA — supports plain numbers and simple a/b expressions (e.g. 50/3)
         if occursin(r"\.baseMVA\s*=", raw)
-            m = match(r"=\s*([0-9.eE+\-]+)", raw)
-            m !== nothing && (baseMVA = parse(Float64, m.captures[1]))
+            m = match(r"=\s*([^\s;]+)", raw)
+            if m !== nothing
+                v = _eval_simple_expr(m.captures[1])
+                v !== nothing && (baseMVA = v)
+            end
 
         # bus matrix
         elseif occursin(r"\.bus\s*=", raw) && !occursin(r"busname", raw)
@@ -136,6 +185,37 @@ function parse_matpower(filepath::String)
     end
 
     size(bus_mat, 1) == 0 && error("No bus data found in $filepath")
+
+    # ── Apply MATLAB post-processing conversions ──────────────────────────────
+    # Some distribution MATPOWER files store loads in kW/kVAr and branch
+    # impedances in Ohms, with explicit MATLAB conversion code.  We detect
+    # those patterns and apply the same conversions in Julia.
+
+    # Pattern 1: loads from kW/kVAr → MW/MVAR
+    #   mpc.bus(:, [PD, QD]) = mpc.bus(:, [PD, QD]) / 1e3
+    load_kw = any(l -> occursin(r"bus\(.*\[PD|bus\(:,.*PD|bus\s*\(:,\s*\[PD", l) &&
+                       occursin(r"/\s*1[Ee]3|/\s*1000", l),
+              lines)
+    if load_kw && size(bus_mat, 2) >= 4
+        bus_mat[:, 3] ./= 1000.0   # Pd: kW → MW
+        bus_mat[:, 4] ./= 1000.0   # Qd: kVAr → MVAR
+    end
+
+    # Pattern 2: branch R, X from Ohms → per-unit
+    #   Vbase = mpc.bus(1, BASE_KV) * 1e3     (V)
+    #   Sbase = mpc.baseMVA * 1e6             (VA)
+    #   mpc.branch(:, [BR_R BR_X]) = ... / (Vbase^2 / Sbase)
+    #   ⟹  Z_base_pu = V_base_kV^2 / baseMVA
+    branch_ohm = any(l -> occursin(r"branch\(.*\[BR_R|branch\(:.*BR_R|Vbase\^2\s*/\s*Sbase", l),
+                 lines)
+    if branch_ohm && size(bus_mat, 2) >= 10 && size(branch_mat, 2) >= 4
+        bus1_baseKV = bus_mat[1, 10]  # column 10 = baseKV of first bus
+        if bus1_baseKV > 0
+            Z_base = bus1_baseKV^2 / baseMVA   # Ω base
+            branch_mat[:, 3] ./= Z_base   # R: Ω → pu
+            branch_mat[:, 4] ./= Z_base   # X: Ω → pu
+        end
+    end
 
     nbus = size(bus_mat, 1)
 

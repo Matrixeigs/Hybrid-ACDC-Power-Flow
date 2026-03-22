@@ -152,11 +152,11 @@ function _gen(id::Int, bus::Int, Pg_pu, Qg_pu, Vg; is_slack=false, baseMVA=_BASE
 end
 
 """
-    _ac_branch(idx, from, to, r, x, b, tap; status=true)
+    _ac_branch(idx, from, to, r, x, b, tap; shift_deg=0.0, status=true)
 
 Create an AC branch for test systems (impedances in per-unit).
 """
-function _ac_branch(idx::Int, from, to, r, x, b, tap; status=true)
+function _ac_branch(idx::Int, from, to, r, x, b, tap; shift_deg=0.0, status=true)
     Branch{AC}(
         index        = idx,
         name         = "Line$idx",
@@ -184,7 +184,7 @@ function _ac_branch(idx::Int, from, to, r, x, b, tap; status=true)
         rate_b_mva   = 100.0,
         rate_c_mva   = 100.0,
         tap          = Float64(tap),
-        shift_deg    = 0.0,
+        shift_deg    = Float64(shift_deg),
         angmin_deg   = -360.0,
         angmax_deg   = 360.0,
         mtbf_hours   = 0.0,
@@ -847,8 +847,9 @@ function _matpower_to_ac(mpd::MatpowerData)
         b_ch = mpd.branch[k, 5]
         tap  = size(mpd.branch, 2) >= 9 ? mpd.branch[k, 9] : 1.0
         tap == 0.0 && (tap = 1.0)
+        shift = size(mpd.branch, 2) >= 10 ? mpd.branch[k, 10] : 0.0  # phase shift in degrees
         br_status = size(mpd.branch, 2) >= 11 ? (mpd.branch[k, 11] > 0) : true
-        push!(ac_branches, _ac_branch(k, from, to, r, x, b_ch, tap; status=br_status))
+        push!(ac_branches, _ac_branch(k, from, to, r, x, b_ch, tap; shift_deg=shift, status=br_status))
     end
 
     return ac_buses, ac_branches, generators, mpd.baseMVA
