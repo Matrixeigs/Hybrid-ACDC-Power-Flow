@@ -21,7 +21,7 @@ using ..MatpowerParser: parse_matpower, MatpowerData
 export build_ieee14_acdc, build_ieee24_3area_acdc, build_ieee118_acdc, build_ac_only_version,
        build_case33bw_acdc, build_case33mg_acdc, build_case69_acdc,
        build_case300_acdc, build_case2000_acdc,
-       build_from_matpower
+       build_from_matpower, build_from_matpower_with_limits
 
 # ═══════════════════════════════════════════════════════════════════════════════
 #  HELPER FUNCTIONS FOR TEST SYSTEM CONSTRUCTION
@@ -1160,6 +1160,56 @@ function build_from_matpower(filepath::String)
         generators;
         baseMVA = baseMVA
     )
+end
+
+"""
+    _extract_Q_limits_raw(mpd::MatpowerData) -> Dict{Int, Tuple{Float64, Float64}}
+
+Extract reactive power limits from MATPOWER gen matrix (columns 4=Qmax, 5=Qmin).
+Limits are aggregated per bus (multiple generators at the same bus are summed)
+and converted to per-unit using baseMVA. Bus indices are sequential (1-based).
+Returns a Dict mapping bus index to `(Qmin, Qmax)` tuples.
+"""
+function _extract_Q_limits_raw(mpd::MatpowerData)
+    ngen = size(mpd.gen, 1)
+    bus_Qmin = Dict{Int, Float64}()
+    bus_Qmax = Dict{Int, Float64}()
+
+    for g in 1:ngen
+        status = size(mpd.gen, 2) >= 8 ? mpd.gen[g, 8] : 1.0
+        status ≤ 0 && continue
+        bi = Int(mpd.gen[g, 1])
+        bi < 1 && continue
+        Qmax = size(mpd.gen, 2) >= 4 ? mpd.gen[g, 4] / mpd.baseMVA : 0.5
+        Qmin = size(mpd.gen, 2) >= 5 ? mpd.gen[g, 5] / mpd.baseMVA : -0.5
+        bus_Qmax[bi] = get(bus_Qmax, bi, 0.0) + Qmax
+        bus_Qmin[bi] = get(bus_Qmin, bi, 0.0) + Qmin
+    end
+
+    return Dict{Int, Tuple{Float64, Float64}}(bi => (bus_Qmin[bi], bus_Qmax[bi]) for bi in keys(bus_Qmin))
+end
+
+"""
+    build_from_matpower_with_limits(filepath::String) -> (HybridPowerSystem, Dict{Int, Tuple{Float64, Float64}})
+
+Like `build_from_matpower`, but also returns reactive power limits extracted
+from the MATPOWER generator data (Qmin/Qmax columns) as `(Qmin, Qmax)` tuples.
+"""
+function build_from_matpower_with_limits(filepath::String)
+    mpd = parse_matpower(filepath)
+    ac_buses, ac_branches, generators, baseMVA = _matpower_to_ac(mpd)
+
+    sys = _build_hybrid_power_system(
+        ac_buses, ac_branches,
+        DCBus[],        # no DC buses
+        Branch{DC}[],   # no DC branches
+        VSCConverter[], # no converters
+        generators;
+        baseMVA = baseMVA
+    )
+
+    Q_limits = _extract_Q_limits_raw(mpd)
+    return sys, Q_limits
 end
 
 end  # module TestSystems

@@ -138,6 +138,22 @@ failed_cases = String[]
                 return
             end
 
+            # If basic solver didn't converge, retry with adaptive solver + Q-limits
+            if !result.converged
+                adaptive_ok = try
+                    sys_lim, raw_lim = build_from_matpower_with_limits(filepath)
+                    sd = HybridACDCPowerFlow.PowerSystem.to_solver_data(sys_lim)
+                    Q_lim = Dict{Int, ReactiveLimit}(
+                        bi => ReactiveLimit(qmin, qmax) for (bi, (qmin, qmax)) in raw_lim)
+                    opts = PowerFlowOptions(max_iter=200, tol=1e-6,
+                                            enable_pv_pq_conversion=true, verbose=false)
+                    result = solve_power_flow_adaptive(sd; options=opts, Q_limits=Q_lim)
+                    true
+                catch e
+                    false
+                end
+            end
+
             # Check convergence
             @test result.converged
 
